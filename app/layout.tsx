@@ -1,8 +1,12 @@
 import type { Metadata, Viewport } from "next";
 import { DM_Sans, Space_Grotesk } from "next/font/google";
+import { Suspense } from "react";
+import { AuthButton } from "@/components/auth/auth-button";
+import { AuthNotice } from "@/components/auth/auth-notice";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
 import { Toaster } from "@/components/ui/sonner";
+import { missingAuthEnv } from "@/lib/env";
 import { SITE_NAME } from "@/data/content";
 import "./globals.css";
 
@@ -43,10 +47,26 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${fontSans.variable} ${fontDisplay.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col bg-background font-sans text-foreground">
-        <SiteHeader />
+        {/* AuthButton is a server component that reads the session cookie; it is
+            passed in as a slot so the client-side header can render it. This
+            makes the root layout dynamic, which is the cost of server-read auth
+            state in the navigation. */}
+        <SiteHeader authSlot={<AuthButton />} />
         <main className="flex-1 pt-18">{children}</main>
         <SiteFooter />
-        <Toaster position="top-right" richColors closeButton />
+
+        {/* Turns ?auth=failed&reason=... into a readable toast, naming the exact
+            variables to fill in when the deployment is unconfigured. Rendered
+            inside Suspense because it reads searchParams. */}
+        <Suspense fallback={null}>
+          <AuthNotice missing={missingAuthEnv()} />
+        </Suspense>
+
+        {/* Single Toaster for the whole app, so every notification - auth
+            results, admin actions, CSV export - appears in the same
+            bottom-right corner. Individual toast() calls must not pass a
+            `position`, or they would escape this. */}
+        <Toaster position="bottom-right" richColors closeButton />
       </body>
     </html>
   );

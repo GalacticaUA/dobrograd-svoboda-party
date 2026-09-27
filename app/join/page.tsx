@@ -4,7 +4,8 @@ import { Reveal } from "@/components/ui/reveal";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { SpotlightCard } from "@/components/ui/spotlight-card";
 import { ShinyLink } from "@/components/ui/shiny-button";
-import { districtOptions, events } from "@/data/content";
+import { ApplicationForm } from "@/components/auth/application-form";
+import { getSessionProfile } from "@/lib/auth/dal";
 
 export const metadata: Metadata = {
   title: "Гражданская приёмная",
@@ -17,7 +18,14 @@ const hours = [
   { day: "Юрпомощь", time: "Ср 17:00 – 20:00" },
 ];
 
-export default function JoinPage() {
+export default async function JoinPage() {
+  // Prefilled, not required. A person removed from the party keeps their Steam
+  // account and can still sign in, so the form has their ID to hand - and that
+  // ID is what a reviewer approves, which is how the old profile and its hours
+  // come back instead of a fresh empty one being created under a typo.
+  const session = await getSessionProfile();
+  const defaultSteamId = session.ok ? session.profile.steamId : "";
+
   return (
     <>
       <section className="mx-auto max-w-3xl px-5 py-24 sm:px-8">
@@ -39,9 +47,22 @@ export default function JoinPage() {
           </p>
         </Reveal>
         <Reveal immediate delay={0.16} className="mt-9">
-          <ShinyLink href="mailto:reception@ldp-freedom.org">Написать в приёмную</ShinyLink>
+          <ShinyLink href="https://docs.google.com/forms/d/e/1FAIpQLSeA5zppgYMnRUlCqJUbaSBo3I2OUHZq9drpyWoFZ6FSiwZ_rA/viewform">Написать в приёмную</ShinyLink>
         </Reveal>
       </section>
+
+      {/* <section id="application" className="mx-auto max-w-3xl scroll-mt-24 px-5 pb-24 sm:px-8">
+        <Reveal immediate>
+          <SectionHeading
+            eyebrow="Анкета"
+            title="Подать заявку"
+            description="Заявка попадает в очередь координационного совета. Решение принимает человек, а не эта страница."
+          />
+        </Reveal>
+        <Reveal immediate delay={0.08} className="mt-10">
+          <ApplicationForm defaultSteamId={defaultSteamId} />
+        </Reveal>
+      </section> */}
 
       <section className="border-y border-border bg-card/30">
         <div className="mx-auto max-w-7xl px-5 py-24 sm:px-8">

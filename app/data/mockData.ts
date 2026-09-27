@@ -12,11 +12,11 @@ export const mockMembers: Member[] = [
 ];
 
 export const mockApplications: Application[] = [
-  { id: "a1", source: "native", name: "Елена Смирнова", email: "elena@mail.ru", phone: "+7 900 111-22-33", discord: "lena_s", steam: "76561198100000001", motivation: "Хочу помогать жителям своего двора разбираться с управляющей компанией. Юрист по образованию.", submittedAt: "2026-09-24", status: "pending", notes: "" },
-  { id: "a2", source: "native", name: "Игорь Ким", email: "kim.igor@yandex.ru", phone: "+7 901 555-44-11", discord: "igor.kim", steam: "76561198100000002", motivation: "Владелец небольшой кофейни. Готов делиться опытом по налогам и проверкам.", submittedAt: "2026-09-23", status: "pending", notes: "" },
-  { id: "a3", source: "google", name: "Sofia Brandt", email: "sofia.b@gmail.com", phone: "+7 902 333-00-99", discord: "sofiab", steam: "76561198100000003", motivation: "Data analyst, want to help with open budget visualisations for district assemblies.", submittedAt: "2026-09-22", status: "pending", notes: "" },
-  { id: "a4", source: "google", name: "Артём Новиков", email: "artem.n@mail.ru", phone: "+7 903 777-12-12", discord: "artem_nov", steam: "76561198100000004", motivation: "Студент, могу вести соцсети и снимать уличные интервью.", submittedAt: "2026-09-20", status: "pending", notes: "" },
-  { id: "a5", source: "native", name: "Ольга Белова", email: "belova@list.ru", phone: "+7 904 222-88-77", discord: "olga.b", steam: "—", motivation: "Пенсионерка, активистка ТСЖ. Хочу участвовать в дворовых собраниях.", submittedAt: "2026-09-18", status: "pending", notes: "" },
+  { id: "a1", source: "native", name: "Елена Смирнова", email: "elena@mail.ru", phone: "+7 900 111-22-33", discord: "lena_s", steam: "76561198100000001", district: "Центральный", motivation: "Хочу помогать жителям своего двора разбираться с управляющей компанией. Юрист по образованию.", submittedAt: "2026-09-24", status: "pending", notes: "" },
+  { id: "a2", source: "native", name: "Игорь Ким", email: "kim.igor@yandex.ru", phone: "+7 901 555-44-11", discord: "igor.kim", steam: "76561198100000002", district: "Северный", motivation: "Владелец небольшой кофейни. Готов делиться опытом по налогам и проверкам.", submittedAt: "2026-09-23", status: "pending", notes: "" },
+  { id: "a3", source: "google", name: "Sofia Brandt", email: "sofia.b@gmail.com", phone: "+7 902 333-00-99", discord: "sofiab", steam: "76561198100000003", district: "Другой", motivation: "Data analyst, want to help with open budget visualisations for district assemblies.", submittedAt: "2026-09-22", status: "pending", notes: "" },
+  { id: "a4", source: "google", name: "Артём Новиков", email: "artem.n@mail.ru", phone: "+7 903 777-12-12", discord: "artem_nov", steam: "76561198100000004", district: "Восточный", motivation: "Студент, могу вести соцсети и снимать уличные интервью.", submittedAt: "2026-09-20", status: "pending", notes: "" },
+  { id: "a5", source: "native", name: "Ольга Белова", email: "belova@list.ru", phone: "+7 904 222-88-77", discord: "olga.b", steam: "—", district: "Заречный", motivation: "Пенсионерка, активистка ТСЖ. Хочу участвовать в дворовых собраниях.", submittedAt: "2026-09-18", status: "pending", notes: "" },
 ];
 
 export const mockEvents: PartyEvent[] = [
@@ -42,7 +42,7 @@ export const mockAvailability: AvailabilitySlot[] = [
 export const mockCms: CmsContent = {
   heroTitle: "Свобода",
   heroSubtitle: "Ваш голос - ваша сила. Ваше будущее - наш приоритет!",
-  mission: "Основанная в 2018 году в Доброграде политическая сила, созданная жителями для жителей. Мы боремся за прозрачность муниципалитета, открытый бюджет и честное самоуправление без бюрократии.",
+  mission: "Основанная в 2018 году в Доброграде политическая сила, созданная жителями для жителей. Мы боремся за прозрачность муниципалитета, открытый бюджет и честное самоуправление.",
   transparencyTitle: "",
   transparencyText: "",
 };

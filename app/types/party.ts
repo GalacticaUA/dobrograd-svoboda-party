@@ -22,6 +22,7 @@ export interface Application {
   phone: string;
   discord: string;
   steam: string;
+  district: string;
   motivation: string;
   submittedAt: string;
   status: ApplicationStatus;

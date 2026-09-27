@@ -1,11 +1,8 @@
 import type { Metadata } from "next";
 import { Check } from "lucide-react";
 import { Reveal } from "@/components/ui/reveal";
-import { SectionHeading } from "@/components/ui/section-heading";
 import { SpotlightCard } from "@/components/ui/spotlight-card";
-import { ShinyLink } from "@/components/ui/shiny-button";
 import { reforms } from "@/data/content";
-import { mockCms } from "@/data/mockData";
 
 export const metadata: Metadata = {
   title: "Реформы",
@@ -93,6 +90,11 @@ export default function ReformsPage() {
         </section>
       ))}
 
+      {/*
+        CTA выключен. При включении понадобятся два импорта, удалённые как
+        неиспользуемые: `SectionHeading` из "@/components/ui/section-heading" и
+        `ShinyLink` из "@/components/ui/shiny-button".
+      */}
       {/* <section className="mx-auto max-w-3xl px-5 py-28 text-center sm:px-8">
         <SectionHeading
           eyebrow="Следующий шаг"

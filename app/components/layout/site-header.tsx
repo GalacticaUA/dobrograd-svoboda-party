@@ -3,19 +3,19 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Menu, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { BirdLogo } from "@/components/layout/bird-logo";
 import { ShinyLink } from "@/components/ui/shiny-button";
 import { cn } from "@/lib/utils";
 
 const nav = [
   { to: "/", label: "Главная" },
-  { to: "/about", label: "О движении" },
+  { to: "/about", label: "О партии" },
   { to: "/reforms", label: "Реформы" },
   { to: "/join", label: "Приёмная" },
 ] as const;
 
-export function SiteHeader() {
+export function SiteHeader({ authSlot }: { authSlot?: ReactNode }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
@@ -37,7 +37,7 @@ export function SiteHeader() {
         scrolled ? "border-b border-border/70 bg-background/75 backdrop-blur-xl" : "bg-transparent",
       )}
     >
-      <div className="mx-auto flex h-18 max-w-7xl items-center justify-between px-5 sm:px-8">
+      <div className="mx-auto flex h-18 max-w-7xl items-center justify-between gap-3 px-5 sm:px-8">
         <Link href="/" aria-label="ЛДП «Свобода» - на главную" onClick={() => setOpen(false)}>
           <BirdLogo compact />
         </Link>
@@ -57,10 +57,11 @@ export function SiteHeader() {
           ))}
         </nav>
 
-        <div className="hidden md:block">
+        <div className="hidden items-center gap-3 md:flex">
           <ShinyLink href="/join" className="px-5 py-2.5">
             Вступить в партию
           </ShinyLink>
+          {authSlot}
         </div>
 
         <button
@@ -96,7 +97,7 @@ export function SiteHeader() {
             ))}
             <div className="pt-3">
               <ShinyLink href="/join" className="w-full" onClick={() => setOpen(false)}>
-                Вступить в движение
+                Вступить в партию
               </ShinyLink>
             </div>
           </nav>
