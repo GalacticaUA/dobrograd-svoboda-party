@@ -28,7 +28,7 @@ export function ManagementTab({ profile }: { profile: ProfileDTO }) {
   const { data, pending, error } = useAsyncData<ApplicationRecord[]>(loadApplications);
 
   return (
-    <StaffOnly role={profile.role} action="application.review">
+    <StaffOnly roles={profile.roles} action="application.review">
       <div className="space-y-4">
         <PageTitle
           title="Управление"

@@ -20,6 +20,9 @@ import { toast } from "sonner";
 
 const REASON_COPY: Record<string, string> = {
   config: "Вход через Steam не настроен на сервере.",
+  // Steam does complete the round trip against a localhost realm, so a local
+  // deployment is a supported configuration and must not be steered towards a
+  // tunnel or told to change an env var that is already correct.
   assertion: "Steam не подтвердил вход. Попробуйте ещё раз.",
   identity: "Не удалось получить профиль Steam.",
   rate: "Слишком много попыток входа. Подождите минуту.",

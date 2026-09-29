@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { AtSign, Eye, EyeOff, Loader2, Save, User } from "lucide-react";
+import { Eye, EyeOff, Loader2, Save, User } from "lucide-react";
 import { toast } from "sonner";
 
 import { LoadingBlock, PageTitle, Panel, fieldCls } from "@/components/portal/primitives";
@@ -57,13 +57,13 @@ function AccountForm({
 
   const [displayName, setDisplayName] = useState(profile.displayName);
   const [about, setAbout] = useState(profile.about);
-  const [telegram, setTelegram] = useState(profile.telegram ?? "");
+  const [discord, setDiscord] = useState(profile.discord ?? "");
   const [contactsPublic, setContactsPublic] = useState(profile.contactsPublic);
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     startTransition(async () => {
-      const result = await saveAccount({ displayName, about, telegram, contactsPublic });
+      const result = await saveAccount({ displayName, about, discord, contactsPublic });
       if (result.ok) {
         onSaved(result.data);
         toast.success("Настройки сохранены");
@@ -128,19 +128,20 @@ function AccountForm({
         </div>
 
         <div>
-          <label htmlFor="telegram" className="mb-1.5 block text-sm text-cloud">
+          <label htmlFor="discord" className="mb-1.5 block text-sm text-cloud">
             Дискорд
           </label>
-          <div className="relative">
-            <AtSign className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <input
-              id="telegram"
-              value={telegram}
-              onChange={(event) => setTelegram(event.target.value)}
-              placeholder="username"
-              className={`${fieldCls} pl-9`}
-            />
-          </div>
+          <input
+            id="discord"
+            value={discord}
+            onChange={(event) => setDiscord(event.target.value)}
+            placeholder="username"
+            maxLength={120}
+            className={fieldCls}
+          />
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            Пусто - значит не показывать ник дискорда. Если хотите, чтобы участники партии видели ваш ник, укажите его здесь. Ник будет виден только участникам партии, не публичному сайту.
+          </p>
         </div>
 
         <button

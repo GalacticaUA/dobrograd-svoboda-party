@@ -16,7 +16,8 @@ import {
 
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { useIsMobile } from "@/hooks/use-mobile";
-import { can, type Action } from "@/lib/permissions";
+import { PermissionsProvider } from "@/components/portal/permissions";
+import type { Action } from "@/lib/permissions";
 import { AccountTab } from "@/components/portal/tabs/account";
 import { AppealsTab } from "@/components/portal/tabs/appeals";
 import { AvailabilityTab } from "@/components/portal/tabs/availability";
@@ -75,15 +76,19 @@ export function PortalDialog({
   open,
   onOpenChange,
   profile,
+  permissions,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   profile: ProfileDTO;
+  permissions: readonly Action[];
 }) {
   const isMobile = useIsMobile();
   const [tab, setTab] = useState("dashboard");
 
-  const visible = TABS.filter((entry) => !entry.action || can(profile.role, entry.action));
+  // Tab visibility is answered from the resolved list, not from `profile.role`.
+  const granted = new Set<Action>(permissions);
+  const visible = TABS.filter((entry) => !entry.action || granted.has(entry.action));
 
   // If a permission is revoked while the modal is open, `tab` may name a tab that no
   // longer exists. Rather than syncing `tab` back in an effect, the fallback is
@@ -95,6 +100,7 @@ export function PortalDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
+      <PermissionsProvider permissions={permissions}>
       <DialogContent
         className={
           // The shared DialogContent is a centred `grid` with `gap-4 p-6`. Only
@@ -167,6 +173,7 @@ export function PortalDialog({
           </div>
         </div>
       </DialogContent>
+      </PermissionsProvider>
     </Dialog>
   );
 }
@@ -240,7 +247,7 @@ function TabBody({
     case "reports":
       return <ReportsTab profile={profile} />;
     case "availability":
-      return <AvailabilityTab role={profile.role} />;
+      return <AvailabilityTab />;
     case "account":
       return <AccountTab />;
     case "management":

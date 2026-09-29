@@ -7,9 +7,10 @@ import { toast } from "sonner";
 import { EmptyState, LoadingBlock, PageTitle, Panel, fieldCls } from "@/components/portal/primitives";
 import { castVote, changePollStatus, loadPolls, removePoll, submitPoll } from "@/lib/portal/actions";
 import { useAsyncData } from "@/hooks/use-async-data";
-import { can, isPollOpen } from "@/lib/permissions";
+import { isPollOpen } from "@/lib/permissions";
 import { POLL_STATUS_LABELS, type PollRecord } from "@/lib/portal/types";
 import type { ProfileDTO } from "@/types/auth";
+import { useCan } from "@/components/portal/permissions";
 
 export function PollsTab({ profile }: { profile: ProfileDTO }) {
   const { data, error, pending, refresh } = useAsyncData<PollRecord[]>(loadPolls);
@@ -57,7 +58,6 @@ export function PollsTab({ profile }: { profile: ProfileDTO }) {
               key={poll.id}
               poll={poll}
               isAuthor={poll.author === profile.steamId}
-              role={profile.role}
               onChanged={refresh}
             />
           ))}
@@ -178,12 +178,10 @@ function ComposePoll({ onDone }: { onDone: () => Promise<void> }) {
 function PollCard({
   poll,
   isAuthor,
-  role,
   onChanged,
 }: {
   poll: PollRecord;
   isAuthor: boolean;
-  role: ProfileDTO["role"];
   onChanged: () => void;
 }) {
   const initial = poll.options.filter((option) => option.ownVote).map((option) => option.id);
@@ -191,7 +189,7 @@ function PollCard({
   const [busy, startTransition] = useTransition();
 
   const open = isPollOpen(poll.status);
-  const isStaff = can(role, "poll.deleteAny");
+  const isStaff = useCan("poll.deleteAny");
   const canDelete = isStaff || (isAuthor && open);
 
   const toggle = (optionId: string) => {
@@ -302,7 +300,7 @@ function PollCard({
       )}
 
       <div className="mt-3 flex flex-wrap justify-end gap-2 border-t border-border pt-3">
-        {can(role, "poll.close") && (
+        {useCan("poll.close") && (
           <button
             type="button"
             disabled={busy}

@@ -25,39 +25,50 @@ import { listApplications } from "@/lib/auth/dal";
 import {
   addHoursAdjustment,
   createAppeal,
+  createCustomRole,
   createPoll,
   deleteAppeal,
+  deleteCustomRole,
   deleteEvent,
   deleteHoursAdjustment,
   deletePoll,
   deleteWorkPoint,
   getAccountProfile,
   getAvailabilityMatrix,
+  addMemberRole,
   getMyHours,
   getOwnAvailability,
+  grantCustomRole,
   listAppeals,
   listAudit,
+  listCustomRoles,
   listDeletedEvents,
   listEvents,
   listHoursAdjustments,
   listPolls,
   listRegistry,
+  listRoleGrants,
   listWorkPoints,
   recordAttendance,
   removeMember,
+  removeMemberRole,
   replaceOwnAvailability,
   restoreEvent,
+  revokeCustomRole,
   setAppealReply,
   setAppealStatus,
-  setMemberRole,
+  setMemberRoles,
+  setMemberApproval,
   setOwnRsvp,
   setPollStatus,
   updateAccountProfile,
+  updateCustomRole,
   updateMemberProfile,
   upsertEvent,
   upsertWorkPoint,
   voteInPoll,
 } from "@/lib/portal/dal";
+import { countTopStanding, readRoleSet } from "@/lib/auth/roles";
 import type {
   AccountProfile,
   AccountUpdateInput,
@@ -67,6 +78,7 @@ import type {
   AuditEntry,
   AvailabilityMatrixRow,
   AvailabilitySlot,
+  CustomRoleRecord,
   EventRecord,
   EventUpsertInput,
   EventWithAttendance,
@@ -74,6 +86,8 @@ import type {
   MyHours,
   PollRecord,
   RegistryEntry,
+  RoleGrantRecord,
+  RoleGrantResult,
   RsvpInput,
   WorkPointInput,
   WorkPointRecord,
@@ -220,14 +234,71 @@ export async function saveAccount(
   }
 }
 
-export async function saveMemberRole(input: {
+/**
+ * Replace somebody's whole role set. The action behind the badge stack's
+ * "apply" and behind the role editor's two columns.
+ *
+ * Returns the roles the server settled on rather than nothing, so the client can
+ * paint what the database now believes. That matters for the leader: adding it
+ * transfers the title, and the previous holder's badge disappears in a different
+ * row of a different table. The caller needs the truth, not an echo of its own
+ * optimistic guess.
+ */
+export async function saveMemberRoles(input: {
   steamId: string;
-  role: Role;
-  status: ApprovalStatus;
-}): Promise<ActionResult> {
+  roles: readonly Role[];
+}): Promise<ActionResult<Role[]>> {
   try {
-    await setMemberRole(input);
+    await setMemberRoles({ steamId: input.steamId, roles: input.roles });
+    return { ok: true, data: await readRoleSet(input.steamId) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+/** The `+ Добавить роль` button. */
+export async function grantMemberRole(
+  steamId: string,
+  role: Role,
+): Promise<ActionResult<Role[]>> {
+  try {
+    await addMemberRole(steamId, role);
+    return { ok: true, data: await readRoleSet(steamId) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+/** The `×` on a badge. */
+export async function revokeMemberRole(
+  steamId: string,
+  role: Role,
+): Promise<ActionResult<Role[]>> {
+  try {
+    await removeMemberRole(steamId, role);
+    return { ok: true, data: await readRoleSet(steamId) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+/** Approve, suspend or expel. Separate from the roles on purpose — see the DAL. */
+export async function saveMemberStatus(
+  steamId: string,
+  status: ApprovalStatus,
+): Promise<ActionResult> {
+  try {
+    await setMemberApproval(steamId, status);
     return { ok: true, data: undefined };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+/** How many approved people can appoint, for the UI's impossible options. */
+export async function loadAppointerCount(): Promise<ActionResult<number>> {
+  try {
+    return { ok: true, data: await countTopStanding() };
   } catch (error) {
     return fail(error);
   }
@@ -482,6 +553,68 @@ export async function removeWorkPoint(id: string): Promise<ActionResult> {
   try {
     await deleteWorkPoint(id);
     return { ok: true, data: undefined };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom roles                                                                  */
+/* -------------------------------------------------------------------------- */
+
+export async function loadCustomRoles(): Promise<ActionResult<CustomRoleRecord[]>> {
+  try {
+    return { ok: true, data: await listCustomRoles() };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function loadRoleGrants(roleId?: number): Promise<ActionResult<RoleGrantRecord[]>> {
+  try {
+    return { ok: true, data: await listRoleGrants(roleId) };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function saveCustomRole(input: {
+  roleId?: number;
+  name: string;
+  description: string;
+  actions: readonly string[];
+}): Promise<ActionResult<number | null>> {
+  try {
+    if (input.roleId === undefined) {
+      return { ok: true, data: await createCustomRole(input) };
+    }
+    await updateCustomRole({ ...input, roleId: input.roleId });
+    return { ok: true, data: null };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function dropCustomRole(roleId: number): Promise<ActionResult> {
+  try {
+    await deleteCustomRole(roleId);
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
+export async function applyRoleGrants(input: {
+  roleId: number;
+  steamIds: readonly string[];
+  mode: "grant" | "revoke";
+}): Promise<ActionResult<RoleGrantResult>> {
+  try {
+    const result =
+      input.mode === "grant"
+        ? await grantCustomRole({ roleId: input.roleId, steamIds: input.steamIds })
+        : await revokeCustomRole({ roleId: input.roleId, steamIds: input.steamIds });
+    return { ok: true, data: result };
   } catch (error) {
     return fail(error);
   }

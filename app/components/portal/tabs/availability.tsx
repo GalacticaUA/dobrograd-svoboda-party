@@ -7,7 +7,6 @@ import { toast } from "sonner";
 import { EmptyState, LoadingBlock, PageTitle, Panel } from "@/components/portal/primitives";
 import { loadAvailability, loadAvailabilityMatrix, saveAvailability } from "@/lib/portal/actions";
 import { useAsyncData } from "@/hooks/use-async-data";
-import { can } from "@/lib/permissions";
 import {
   WEEKDAY_LABELS,
   WEEKDAY_SHORT,
@@ -16,7 +15,7 @@ import {
   type AvailabilityMatrixRow,
   type AvailabilitySlot,
 } from "@/lib/portal/types";
-import type { Role } from "@/types/party";
+import { useCan } from "@/components/portal/permissions";
 
 interface SlotDraft {
   fromMin: number;
@@ -43,8 +42,11 @@ const timeCls =
  * Staff get a read-only grid of everyone else's week underneath, which is the
  * actual reason this data exists - picking a date that most people are free.
  */
-export function AvailabilityTab({ role }: { role: Role }) {
+export function AvailabilityTab() {
   const { data, error, pending, refresh } = useAsyncData<AvailabilitySlot[]>(loadAvailability);
+  // Above the early returns, because it is a hook and the loading and error
+  // branches are still renders of this component.
+  const mayViewAll = useCan("availability.viewAll");
 
   if (pending) return <LoadingBlock />;
   if (error) {
@@ -61,7 +63,7 @@ export function AvailabilityTab({ role }: { role: Role }) {
   return (
     <div className="space-y-4">
       <AvailabilityForm initial={data ?? []} onSaved={refresh} />
-      {can(role, "availability.viewAll") ? <AvailabilityMatrix /> : null}
+      {mayViewAll ? <AvailabilityMatrix /> : null}
     </div>
   );
 }

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Lock } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { can, type Action } from "@/lib/permissions";
+import { canAny, type Action } from "@/lib/permissions";
 import type { Role } from "@/types/party";
 
 /**
@@ -80,17 +80,25 @@ export function LoadingBlock({ label = "Загрузка…" }: { label?: string
  * Used by tabs whose whole content is staff-only. A tab that silently renders
  * empty when the viewer lacks the role is indistinguishable from a bug, so the
  * viewer is told plainly what happened.
+ *
+ * Takes the whole role *set*, not one role. It used to take the viewer's single
+ * `profile.role` — the highest-standing one — and ask about that, which happened
+ * to give the right answer for the three built-in roles only because a person
+ * holding both `admin` and `moderator` happened to sort first the way the check
+ * needed. The question this gate actually asks is "does any role the viewer
+ * holds permit this action", and that is `canAny` over the set, the same
+ * question the server asks.
  */
 export function StaffOnly({
-  role,
+  roles,
   action,
   children,
 }: {
-  role: Role;
+  roles: readonly Role[];
   action: Action;
   children: ReactNode;
 }) {
-  if (can(role, action)) return <>{children}</>;
+  if (canAny(roles, action)) return <>{children}</>;
 
   return (
     <Panel className="flex flex-col items-center gap-3 py-14 text-center">

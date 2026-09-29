@@ -28,7 +28,6 @@ import {
   setRsvp,
 } from "@/lib/portal/actions";
 import { useAsyncData } from "@/hooks/use-async-data";
-import { can } from "@/lib/permissions";
 import {
   EVENT_DESCRIPTION_MAX,
   EVENT_TITLE_MAX,
@@ -42,6 +41,7 @@ import type {
   EventWithAttendance,
 } from "@/lib/portal/types";
 import type { ProfileDTO } from "@/types/auth";
+import { useCan } from "@/components/portal/permissions";
 
 /** How a state is labelled. Keyed off the clock, not `status` - see EventState. */
 const STATE_LABELS: Record<EventState, string> = {
@@ -82,8 +82,17 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
   const [creating, setCreating] = useState(false);
   const [showDeleted, setShowDeleted] = useState(false);
 
-  const isStaff = can(profile.role, "event.edit");
-  const canDelete = can(profile.role, "event.delete");
+  // Three distinct questions, previously collapsed into one `isStaff` flag that
+  // meant all three at once:
+  //   mayCreate     - may I schedule anything at all
+  //   mayEditAny    - may I change somebody else's event
+  //   mayDeleteAny  - may I hide anybody's event
+  // A row the viewer created is editable and deletable on `mayCreate` alone, which
+  // is what lets a plain member keep their own schedule without becoming staff.
+  const mayCreate = useCan("event.create");
+  const mayEditAny = useCan("event.editAny");
+  const mayDeleteAny = useCan("event.deleteAny");
+  const mySteamId = profile.steamId;
 
   if (pending) return <LoadingBlock />;
   if (error) {
@@ -105,7 +114,7 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
         title="Расписание"
         sub="События и кто на них записан."
         action={
-          isStaff ? (
+          mayCreate ? (
             <button
               type="button"
               onClick={() => {
@@ -121,7 +130,7 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
         }
       />
 
-      {isStaff && (creating || editing) && (
+      {mayCreate && (creating || editing) && (
         <EventForm
           event={editing}
           onDone={async () => {
@@ -135,7 +144,7 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
       {events.length === 0 ? (
         <EmptyState
           title="Событий пока нет"
-          hint={isStaff ? "Создайте первое мероприятие." : "Как только партия назначит сбор, оно появится здесь."}
+          hint={mayCreate ? "Создайте первое мероприятие." : "Как только партия назначит сбор, оно появится здесь."}
         />
       ) : (
         <ul className="space-y-3">
@@ -144,8 +153,10 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
               key={event.id}
               event={event}
               profile={profile}
-              isStaff={isStaff}
-              canDelete={canDelete}
+              mayCreate={mayCreate}
+              mayEditAny={mayEditAny}
+              mayDeleteAny={mayDeleteAny}
+              viewerSteamId={mySteamId}
               onChanged={refresh}
               onEdit={() => {
                 setEditing(event);
@@ -156,7 +167,7 @@ export function ScheduleTab({ profile }: { profile: ProfileDTO }) {
         </ul>
       )}
 
-      {canDelete && (
+      {mayDeleteAny && (
         <div className="border-t border-border pt-3">
           <button
             type="button"
@@ -422,15 +433,19 @@ function ToggleRow({
 function EventCard({
   event,
   profile,
-  isStaff,
-  canDelete,
+  mayCreate,
+  mayEditAny,
+  mayDeleteAny,
+  viewerSteamId,
   onChanged,
   onEdit,
 }: {
   event: EventWithAttendance;
   profile: ProfileDTO;
-  isStaff: boolean;
-  canDelete: boolean;
+  mayCreate: boolean;
+  mayEditAny: boolean;
+  mayDeleteAny: boolean;
+  viewerSteamId: string;
   onChanged: () => void;
   onEdit: () => void;
 }) {
@@ -439,6 +454,18 @@ function EventCard({
   const [details, setDetails] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [removing, setRemoving] = useState(false);
+
+  // Per row, not per viewer. These two are the whole point of the role system for
+  // this tab: a member with `event.create` keeps full control of the meetings they
+  // called, and nothing over anybody else's. `createdBy` is null for events written
+  // before the column existed, and those are staff-only - a null author is not a
+  // claim of ownership. The same pairing is evaluated again server-side.
+  const isAuthor = event.createdBy != null && event.createdBy === viewerSteamId;
+  const canEdit = mayEditAny || (isAuthor && mayCreate);
+  const canDelete = mayDeleteAny || (isAuthor && mayCreate);
+  // Closing an event and crediting hours is a moderation act on the party's record,
+  // never a self-service one, so it stays a flat permission with no own/any variant.
+  const mayClose = useCan("event.close");
 
   const rsvped = event.ownStatus === "rsvp" || event.ownStatus === "attended";
   // Signup is open by policy (`status`) and by clock. The clock half matters more
@@ -582,7 +609,7 @@ function EventCard({
         )}
         {rsvped && <span className="text-xs text-primary">вы записаны</span>}
 
-        {isStaff && (
+        {canEdit && (
           <div className="ml-auto flex gap-2">
             <button
               type="button"
@@ -592,7 +619,7 @@ function EventCard({
               <Pencil className="h-3.5 w-3.5" />
               Изменить
             </button>
-            {can(profile.role, "event.close") && (
+            {mayClose && (
               <button
                 type="button"
                 onClick={() => setClosing((value) => !value)}
@@ -639,7 +666,7 @@ function EventCard({
       )}
 
       {details && (
-        <EventDetailsDialog event={event} canSeeReasons={isStaff} onClose={() => setDetails(false)} />
+        <EventDetailsDialog event={event} canSeeReasons={mayEditAny} onClose={() => setDetails(false)} />
       )}
 
       {closing && (

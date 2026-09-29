@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { AtSign, Mail, MapPin, Phone, Send, Video } from "lucide-react";
+import { AtSign, Mail, MapPin, Phone, Send, Video, GlobeCode, UsersRound } from "lucide-react";
 import { BirdLogo } from "@/components/layout/bird-logo";
 
 export function SiteFooter() {
@@ -46,7 +46,7 @@ export function SiteFooter() {
           <ul className="mt-4 space-y-2.5 text-sm text-muted-foreground">
             <li>Пн - Пт · 10:00 – 19:00</li>
             <li>Суббота · 11:00 – 15:00</li>
-            <li>Юрпомощь · Ср 17:00 – 20:00</li>
+            {/* <li>Юрпомощь · Ср 17:00 – 20:00</li> */}
             <li className="text-primary">Всегда бесплатно.</li>
           </ul>
         </div>
@@ -57,6 +57,8 @@ export function SiteFooter() {
             <li className="flex gap-2.5"><MapPin className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> ул. Франклин, 9, Доброград</li>
             <li className="flex gap-2.5"><Phone className="h-4 w-4 shrink-0 text-primary" /> +1 (231) 547-4000</li>
             <li className="flex gap-2.5"><Mail className="h-4 w-4 shrink-0 text-primary" /> svoboda@ldp-freedom.org</li>
+            <li className="flex gap-2.5"><GlobeCode className="h-4 w-4 shrink-0 text-primary" /> <a href="https://forum.octothorp.team/topic/13599/%D0%BF%D0%B0%D1%80%D1%82%D0%B8%D1%8F-%D1%81%D0%B2%D0%BE%D0%B1%D0%BE%D0%B4%D0%B0" className="story-link hover:text-cloud">Форум</a></li>
+            <li className="flex gap-2.5"><UsersRound className="h-4 w-4 shrink-0 text-primary" /> <a href="https://discord.gg/PZUnuNvjtt" className="story-link hover:text-cloud">Discord</a></li>
           </ul>
         </div>
       </div>

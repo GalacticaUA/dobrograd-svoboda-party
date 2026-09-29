@@ -13,7 +13,7 @@ import "server-only";
  *   - A signature computed in the browser protects nothing. Verifying a
  *     signature requires the signing key, so the key must be in the JS bundle,
  *     and anyone with DevTools can read it and mint a token claiming
- *     `role: "leader"` with a signature that validates. Here the key is read
+ *     `roles: ["leader"]` with a signature that validates. Here the key is read
  *     from `APP_SESSION_SECRET` on the server and is never shipped to a
  *     browser, so a forged token fails verification at the DAL.
  *
@@ -33,6 +33,7 @@ import { getSessionSecret } from "@/lib/env";
 import { isSteamId64 } from "@/lib/auth/profile";
 import { SESSION_COOKIE_NAME, SESSION_MAX_AGE_MS } from "@/types/auth";
 import type { ProfileDTO, SessionFailure, SessionPayload } from "@/types/auth";
+import { normalizeRoles, isRole, topRole, type Role } from "@/types/party";
 
 /** Stamped into every token so a token minted for another app is rejected. */
 const ISSUER = "svoboda.party";
@@ -40,6 +41,37 @@ const AUDIENCE = "svoboda.party.portal";
 
 function signingKey(): Uint8Array {
   return new TextEncoder().encode(getSessionSecret());
+}
+
+/**
+ * Read the role set out of a verified payload, or `null` if it is not one.
+ *
+ * Two shapes are accepted. A token minted since 005 carries `roles`, an array. A
+ * token minted before it carries a single `role`, and has to keep working for as
+ * long as the 24-hour lifetime says it does — an upgrade that logged out every
+ * signed-in moderator and admin would be a self-inflicted outage. A single valid
+ * role is therefore read as a set of one.
+ *
+ * The check is strict: an array is only accepted when it is non-empty and every
+ * element is a role this build knows. Anything else is `null`, which refuses the
+ * token outright rather than quietly dropping the values it does not recognise.
+ * That matters because a role somebody added in the database without shipping the
+ * code would otherwise be silently discarded here, and the person holding it would
+ * find themselves a member with no explanation.
+ */
+function readRoles(payload: Record<string, unknown>): Role[] | null {
+  const { roles, role } = payload;
+
+  if (Array.isArray(roles)) {
+    if (roles.length === 0) return null;
+    if (!roles.every(isRole)) return null;
+    return normalizeRoles(roles);
+  }
+
+  // Pre-005 token.
+  if (isRole(role)) return normalizeRoles(role);
+
+  return null;
 }
 
 /**
@@ -55,6 +87,7 @@ export async function createSession(profile: ProfileDTO): Promise<void> {
 
   const token = await new SignJWT({
     steamId: profile.steamId,
+    roles: profile.roles,
     role: profile.role,
     status: profile.status,
     issuedAt,
@@ -122,17 +155,23 @@ export async function verifySessionToken(token: string | undefined): Promise<Ses
       clockTolerance: 0,
     });
 
-    const { steamId, role, status, issuedAt, expiresAt } = payload as Record<string, unknown>;
+    const { steamId, status, issuedAt, expiresAt } = payload as Record<string, unknown>;
 
     if (typeof steamId !== "string" || !isSteamId64(steamId)) return null;
     if (typeof issuedAt !== "number" || typeof expiresAt !== "number") return null;
-    if (role !== "leader" && role !== "admin" && role !== "member") return null;
+    // `readRoles`, not a hand-written list. The roles arrive from inside a signed
+    // token, but they were written from database rows at some point in the past,
+    // and a value this code does not recognise means the two have drifted — which
+    // for a person who was just promoted to a new role means they cannot sign in
+    // at all. The list lives in @/types/party, next to the enum it mirrors.
+    const roles = readRoles(payload as Record<string, unknown>);
+    if (!roles) return null;
     if (status !== "pending" && status !== "approved" && status !== "rejected") return null;
 
     if (expiresAt - issuedAt !== SESSION_MAX_AGE_MS) return null;
     if (Date.now() >= expiresAt) return null;
 
-    return { steamId, role, status, issuedAt, expiresAt };
+    return { steamId, roles, role: topRole(roles), status, issuedAt, expiresAt };
   } catch {
     // Expired, tampered, or malformed. Indistinguishable by design.
     return null;
@@ -175,7 +214,7 @@ export async function inspectSessionToken(
     return { ok: false, reason: code === "ERR_JWT_EXPIRED" ? "expired" : "invalid" };
   }
 
-  const { steamId, role, status, issuedAt, expiresAt } = payload;
+  const { steamId, status, issuedAt, expiresAt } = payload;
 
   if (typeof steamId !== "string" || !isSteamId64(steamId)) {
     return { ok: false, reason: "invalid" };
@@ -183,7 +222,8 @@ export async function inspectSessionToken(
   if (typeof issuedAt !== "number" || typeof expiresAt !== "number") {
     return { ok: false, reason: "invalid" };
   }
-  if (role !== "leader" && role !== "admin" && role !== "member") {
+  const roles = readRoles(payload as Record<string, unknown>);
+  if (!roles) {
     return { ok: false, reason: "invalid" };
   }
   if (status !== "pending" && status !== "approved" && status !== "rejected") {
@@ -196,7 +236,10 @@ export async function inspectSessionToken(
     return { ok: false, reason: "expired" };
   }
 
-  return { ok: true, payload: { steamId, role, status, issuedAt, expiresAt } as SessionPayload };
+  return {
+    ok: true,
+    payload: { steamId, roles, role: topRole(roles), status, issuedAt, expiresAt } as SessionPayload,
+  };
 }
 
 

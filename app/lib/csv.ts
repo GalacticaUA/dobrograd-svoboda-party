@@ -188,6 +188,13 @@ export interface RegistryCsvRow {
   name: string;
   persona: string;
   steamId: string;
+  /**
+   * Every role, joined for the cell.
+   *
+   * A single string rather than an array because a CSV cell is a string, and the
+   * alternative — one column per role — is a schema change every time the party
+   * adds a role. The separator is `; ` because a comma is the delimiter.
+   */
   role: string;
   status: string;
   totalHours: number;
@@ -203,8 +210,26 @@ export interface RegistryCsvRow {
 const REGISTRY_ROLE_LABEL: Record<string, string> = {
   leader: "Лидер",
   admin: "Админ",
-  member: "Работник",
+  moderator: "Модератор",
+  member: "Участник",
 };
+
+/**
+ * The label for one role, or its raw value.
+ *
+ * `role-labels.ts` holds the same map, and this re-declares it only because the
+ * CSV wants the raw `member` to survive as "Участник" even though the registry tab
+ * used to call it "Работник" — a divergence that was a bug, not a feature, and is
+ * now gone from both sides.
+ */
+function registryRoleLabel(role: string): string {
+  return REGISTRY_ROLE_LABEL[role] ?? role;
+}
+
+/** `["leader", "admin"]` -> `"Лидер; Админ"`. Already-labelled values pass through. */
+export function joinRoleLabels(roles: readonly string[]): string {
+  return roles.map(registryRoleLabel).join("; ");
+}
 
 const REGISTRY_STATUS_LABEL: Record<string, string> = {
   approved: "Одобрен",
@@ -229,7 +254,12 @@ export function buildRegistryCsv(rows: RegistryCsvRow[]): string {
     REGISTRY_COLUMNS.map((column) => {
       switch (column.key) {
         case "role":
-          return escapeCell(REGISTRY_ROLE_LABEL[row.role] ?? row.role);
+          // Already a joined, human-readable string: the caller labelled the roles
+          // with `joinRoleLabels`, because it is the one holding the set. Labelling
+          // again here would be harmless for known values and would mangle any that
+          // are not — and a role the CSV does not know about is exactly the one
+          // somebody reading the export needs to see.
+          return escapeCell(row.role);
         case "status":
           return escapeCell(REGISTRY_STATUS_LABEL[row.status] ?? row.status);
         default:

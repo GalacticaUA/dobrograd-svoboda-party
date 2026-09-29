@@ -7,9 +7,10 @@ import { toast } from "sonner";
 import { EmptyState, LoadingBlock, PageTitle, Panel, fieldCls } from "@/components/portal/primitives";
 import { changeAppealReply, changeAppealStatus, loadAppeals, removeAppeal, submitAppeal } from "@/lib/portal/actions";
 import { useAsyncData } from "@/hooks/use-async-data";
-import { can, isAppealOpen } from "@/lib/permissions";
+import { isAppealOpen } from "@/lib/permissions";
 import { APPEAL_STATUS_LABELS, type AppealRecord, type AppealStatus } from "@/lib/portal/types";
 import type { ProfileDTO } from "@/types/auth";
+import { useCan } from "@/components/portal/permissions";
 
 const STATUSES: AppealStatus[] = ["new", "in_review", "done", "rejected"];
 
@@ -76,7 +77,6 @@ export function AppealsTab({ profile }: { profile: ProfileDTO }) {
               key={appeal.id}
               appeal={appeal}
               isAuthor={appeal.author === profile.steamId}
-              role={profile.role}
               onChanged={refresh}
             />
           ))}
@@ -142,23 +142,21 @@ function ComposeCard({ onDone }: { onDone: () => Promise<void> }) {
 function AppealCard({
   appeal,
   isAuthor,
-  role,
   onChanged,
 }: {
   appeal: AppealRecord;
   isAuthor: boolean;
-  role: ProfileDTO["role"];
   onChanged: () => void;
 }) {
   const [reply, setReply] = useState(appeal.staffReply ?? "");
   const [confirming, setConfirming] = useState(false);
   const [busy, startTransition] = useTransition();
 
-  const isStaff = can(role, "appeal.deleteAny");
+  const isStaff = useCan("appeal.deleteAny");
   // The author may withdraw an appeal only while it is still open; once it records
   // a decision it becomes part of the council's history.
   const canDelete = isStaff || (isAuthor && isAppealOpen(appeal.status));
-  const canReply = can(role, "appeal.reply");
+  const canReply = useCan("appeal.reply");
 
   const run = (task: () => Promise<{ ok: boolean; error?: string }>, okMessage: string) => {
     startTransition(async () => {

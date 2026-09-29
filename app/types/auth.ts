@@ -33,7 +33,19 @@ export const SESSION_COOKIE_NAME = "svoboda_session";
 export interface SessionPayload {
   /** SteamID64 of the authenticated user. Mirrors the JWT `sub` claim. */
   steamId: string;
-  /** Role at the moment of sign-in. Advisory only; see note above. */
+  /**
+   * Roles at the moment of sign-in. Advisory only; see note above.
+   *
+   * An array since 005, because a person can hold several roles and a token that
+   * can only say one would immediately under-report them: the Data Access Layer
+   * re-reads the live rows anyway, so this is only ever used to render something
+   * immediately and never to answer a permission question.
+   */
+  roles: Role[];
+  /**
+   * The single highest-standing role, kept for tokens minted before 005 and for
+   * the handful of readers that want a scalar. Always consistent with `roles`.
+   */
   role: Role;
   /** Vetting state at the moment of sign-in. */
   status: ApprovalStatus;
@@ -45,11 +57,6 @@ export interface SessionPayload {
 
 /** Mirrors the `approval_status` enum in supabase/schema.sql. */
 export type ApprovalStatus = "pending" | "approved" | "rejected";
-
-/** Roles permitted to reach the admin portal. Mirrors `isStaff` in hooks/usePortal.ts. */
-export function isStaffRole(role: Role): boolean {
-  return role === "leader" || role === "admin";
-}
 
 /**
  * The minimum safe projection of a `profiles` row for use in client components.
@@ -63,6 +70,21 @@ export interface ProfileDTO {
   steamId: string;
   persona: string;
   avatarUrl: string;
+  /**
+   * Every built-in role this person holds, highest standing first.
+   *
+   * The authoritative field since 005. Never `member` alongside another role, and
+   * exactly `["member"]` when they hold nothing else — see `normalizeRoles`.
+   */
+  roles: Role[];
+  /**
+   * The single highest-standing role, kept for the code that still wants a scalar.
+   *
+   * Derived from `roles` at the boundary and not stored separately anywhere, so the
+   * two cannot disagree. Prefer `roles`; this exists so a caller that genuinely
+   * wants "which role matters most" does not have to recompute it, and so a
+   * token minted before 005 still means something.
+   */
   role: Role;
   status: ApprovalStatus;
 }
@@ -86,6 +108,16 @@ export interface SteamIdentity {
 export interface ApplicationRecord {
   id: string;
   source: ApplicationSource;
+  /**
+   * True when this entry is a Steam sign-in rather than a form submission.
+   *
+   * A flag and not a third `application_source` value: these entries are never
+   * inserted, and adding a value to a Postgres enum is a migration. Reviewers
+   * need to tell the two apart — a form arrives with a name, a district and a
+   * motivation, a sign-in arrives with a Steam persona and nothing else — so the
+   * distinction belongs in the DTO rather than only in the missing columns.
+   */
+  fromSignIn?: boolean;
   name: string;
   email: string;
   phone: string;
@@ -97,6 +129,32 @@ export interface ApplicationRecord {
   notes: string;
   submittedAt: string;
   reviewedAt: string | null;
+}
+
+/**
+ * A `profiles` row as read by the admin portal's people list.
+ *
+ * Every Steam identity that ever signed in has a row here, whatever its status,
+ * which is the point of the screen: somebody who signed in and never applied is
+ * in `profiles` and nowhere else, so a queue built from `join_applications`
+ * cannot show them at all.
+ *
+ * Carries no `notes` and no `approved_by`. `notes` is a moderator's private
+ * column and this table renders into the browser.
+ */
+export interface ProfileRecord {
+  steamId: string;
+  displayName: string;
+  persona: string;
+  realName: string | null;
+  /** Every built-in role held. See `ProfileDTO.roles`. */
+  roles: Role[];
+  /** Highest-standing role. See `ProfileDTO.role`. */
+  role: Role;
+  status: ApprovalStatus;
+  discord: string | null;
+  createdAt: string;
+  approvedAt: string | null;
 }
 
 /** Result of re-checking a session at the moment of an action. */

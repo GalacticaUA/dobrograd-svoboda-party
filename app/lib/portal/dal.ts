@@ -21,11 +21,21 @@ import "server-only";
  * disagree about who is allowed to do what.
  */
 
-import { requireSession, requireStaff, SessionError } from "@/lib/auth/dal";
+import { requirePermission, requireSession } from "@/lib/auth/dal";
+import { SessionError } from "@/lib/auth/session-error";
 import { EVENT_DESCRIPTION_MAX, EVENT_TITLE_MAX } from "@/lib/portal/event-state";
 import { getSupabaseAdmin } from "@/lib/supabase/server";
 import { queryError, isMissingObject } from "@/lib/supabase/errors";
-import { can, isAppealOpen, isPollOpen } from "@/lib/permissions";
+import {
+  isAppealOpen,
+  isPollOpen,
+  applyChange,
+  canChangeRoles,
+  isAppointer,
+  type Action,
+} from "@/lib/permissions";
+import { assertCan, canAct, canGrantAll, isGrantable } from "@/lib/permissions/effective";
+import { countTopStanding, readRoleSet, readRoleSets } from "@/lib/auth/roles";
 import { eventState } from "@/lib/portal/event-state";
 import {
   APPEAL_STATUS_LABELS,
@@ -39,6 +49,7 @@ import {
   type AuditEntry,
   type AvailabilityMatrixRow,
   type AvailabilitySlot,
+  type CustomRoleRecord,
   type DeclineRecord,
   type EventState,
   type EventStatus,
@@ -51,12 +62,14 @@ import {
   type PollRecord,
   type PublicEvent,
   type RegistryEntry,
+  type RoleGrantRecord,
+  type RoleGrantResult,
   type RsvpInput,
   type WorkPointInput,
   type WorkPointRecord,
 } from "@/lib/portal/types";
-import type { ApprovalStatus } from "@/types/auth";
-import type { Role } from "@/types/party";
+import type { ApprovalStatus, ProfileDTO } from "@/types/auth";
+import { isAppointment, normalizeRoles, type Role } from "@/types/party";
 
 /* -------------------------------------------------------------------------- */
 /* Audit                                                                        */
@@ -140,8 +153,11 @@ function num(value: unknown): number {
 /* Account                                                                      */
 /* -------------------------------------------------------------------------- */
 
+// `role` is deliberately absent. It is the cache column and can only name the
+// highest-standing role, so selecting it would report an admin who is also a
+// moderator as an admin alone. The roles come from the assignment rows instead.
 const ACCOUNT_COLUMNS =
-  "steam_id, persona, avatar_url, role, status, display_name, about, telegram, " +
+  "steam_id, persona, avatar_url, status, display_name, about, telegram, " +
   "contacts_public, real_name, discord, phone, created_at, approved_at";
 
 export async function getAccountProfile(): Promise<AccountProfile> {
@@ -161,11 +177,14 @@ async function readAccountProfile(steamId: string): Promise<AccountProfile> {
   }
 
   const row = data as unknown as Record<string, unknown>;
+  const roles = await readRoleSet(steamId);
+
   return {
     steamId,
     persona: String(row.persona ?? ""),
     avatarUrl: String(row.avatar_url ?? ""),
-    role: row.role as Role,
+    roles,
+    role: roles[0],
     status: row.status as AccountProfile["status"],
     displayName: String(row.display_name ?? ""),
     about: String(row.about ?? ""),
@@ -189,20 +208,23 @@ async function readAccountProfile(steamId: string): Promise<AccountProfile> {
  */
 export async function updateAccountProfile(input: AccountUpdateInput): Promise<AccountProfile> {
   const session = await requireSession();
-  if (!can(session.role, "profile.editOwn")) throw new SessionError("forbidden");
+  await assertCan(session, "profile.editOwn");
 
   const displayName = input.displayName.trim().slice(0, 60);
-  const telegram = input.telegram.trim();
-  if (telegram.length > 0 && !telegram.startsWith("@")) {
-    throw new Error("Телеграм указывается с @, например @svoboda");
-  }
+
+  // A leading "@" is stripped rather than demanded. Requiring it was friction
+  // with no payoff: Discord has since moved to plain usernames, and rejecting
+  // "user" while accepting "@user" only teaches people the field is picky. What
+  // is stored is always the bare handle, so nobody ends up with "@@name" after
+  // typing a name that already carried one.
+  const discord = input.discord.trim().replace(/^@+/, "").slice(0, 120);
 
   const { error } = await getSupabaseAdmin()
     .from("profiles")
     .update({
       display_name: displayName,
       about: input.about.trim().slice(0, 1000),
-      telegram: telegram.length > 0 ? telegram : null,
+      discord: discord.length > 0 ? discord : null,
       contacts_public: input.contactsPublic,
     })
     .eq("steam_id", session.steamId);
@@ -223,61 +245,220 @@ export async function updateAccountProfile(input: AccountUpdateInput): Promise<A
 export async function getMemberProfile(steamId: string): Promise<AccountProfile> {
   const session = await requireSession();
   const own = session.steamId === steamId;
-  if (!own && !can(session.role, "profile.editAny")) throw new SessionError("forbidden");
+  if (!own) await assertCan(session, "profile.editAny");
   return readAccountProfile(steamId);
 }
 
 /**
- * Change a member's role or approval status. Leader only.
+ * Replace a member's whole role set. Leader or admin only.
  *
- * Guards against a leader demoting themselves into a state where nobody holds the
- * role any more, which would lock the portal permanently with no UI to undo it.
+ * The rules are not the permission matrix's to decide, so they live in
+ * `canChangeRoles` and are called from here: this function supplies the
+ * authoritative counts and enforces the answer. The badges in the UI ask the same
+ * function, so the two cannot offer different futures.
+ *
+ * `roles` is the complete set, not a delta. A set is what the database can be asked
+ * to enforce — "make this person exactly a moderator" is checkable, whereas
+ * "add a moderator, then maybe add a leader, and roll back if the second fails" is
+ * two decisions that can disagree — and it is what the client already has in hand,
+ * having just rendered the row it is about to change.
+ *
+ * `[]` is a real value, not an omission: it means "appointments none", the member
+ * keeps their membership and loses every title.
+ *
+ * The write goes through `set_profile_roles` rather than a direct insert, and that
+ * is the point of the RPC: moving the title has to be atomic. Two clicks on two
+ * people would otherwise be two independent writes, and there is a moment between
+ * them where the database holds two leaders — exactly what the unique index exists
+ * to forbid, and exactly what a client-side check cannot see.
+ *
+ * Approval is not part of this. It is a column with its own reasons, it is edited
+ * from a different control, and it was a source of a real bug: sending it here
+ * meant a status change repeated whatever role list the client happened to be
+ * holding. `setMemberApproval` is the only way to move it.
  */
-export async function setMemberRole(input: {
+export async function setMemberRoles(input: {
   steamId: string;
-  role: Role;
-  status: AccountProfile["status"];
+  roles: readonly Role[];
 }): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "profile.setRole")) throw new SessionError("forbidden");
+  await assertCan(actor, "profile.setRole");
 
-  const { data: target } = await getSupabaseAdmin()
+  // Existence only. What is being changed is in `profile_role_assignments`, and the
+  // row's status is nobody's business in this function — asking for a column and
+  // not using it is how a role edit ends up reporting a status it did not touch.
+  const { data: target, error: targetError } = await getSupabaseAdmin()
     .from("profiles")
-    .select("role")
+    .select("steam_id")
     .eq("steam_id", input.steamId)
     .maybeSingle();
 
+  if (targetError) throw queryError("Не удалось прочитать участника", targetError);
   if (!target) throw new Error("Участник не найден");
 
-  const { data: leaders } = await getSupabaseAdmin()
-    .from("profiles")
-    .select("steam_id")
-    .eq("role", "leader")
-    .eq("status", "approved");
+  const targetRoles = await readRoleSet(input.steamId);
 
-  const willLoseLeadership =
-    (target as { role: Role }).role === "leader" && input.role !== "leader";
-  if (willLoseLeadership && ((leaders ?? []) as unknown[]).length <= 1) {
-    throw new Error("Нельзя снять роль лидера с последним лидером");
-  }
+  // Same count, same question, one number. `countTopStanding` counts people rather
+  // than rows, so somebody who is both leader and admin is one appointable person
+  // and not two.
+  const verdict = canChangeRoles({
+    actorRoles: actor.roles,
+    targetRoles,
+    change: { kind: "set", roles: input.roles },
+    counts: { topStandingCount: await countTopStanding() },
+  });
 
-  const { error } = await getSupabaseAdmin()
-    .from("profiles")
-    .update({
-      role: input.role,
-      status: input.status,
-      approved_at: input.status === "approved" ? new Date().toISOString() : null,
-    })
+  if (!verdict.ok) throw new Error(verdict.reason);
+
+  const { data: before } = await getSupabaseAdmin()
+    .from("profile_role_assignments")
+    .select("role")
     .eq("steam_id", input.steamId);
 
-  if (error) throw queryError(`Не удалось изменить роль`, error);
+  const { error } = await getSupabaseAdmin().rpc("set_profile_roles", {
+    p_steam_id: input.steamId,
+    // Appointment roles only. `normalizeRoles` is the right thing to ask for the
+    // caller's intent — "no roles" is `["member"]` — but `member` is not a row in
+    // `profile_role_assignments` and the RPC deletes-then-inserts what it is given.
+    // Passing it would either fail on the enum's intent or, worse, leave a
+    // `member` row that the trigger would then have to special-case. `[]` is the
+    // "appointments none" case the function above already documents.
+    p_roles: normalizeRoles(input.roles).filter(isAppointment) as unknown as string[],
+    p_actor: actor.steamId,
+  });
+
+  if (error) throw queryError("Не удалось изменить роли", error);
 
   await writeAudit({
     actor: actor.steamId,
     action: "profile.setRole",
     entity: "profiles",
     entityId: input.steamId,
-    meta: { from: (target as { role: Role }).role, to: input.role, status: input.status },
+    meta: {
+      // Both sets, not "from" and "to". The audit reader's question after 005 is
+      // "what changed", and for somebody who went from admin+moderator to moderator
+      // a from/to pair of single roles would say only half of it.
+      //
+      // No status here, because this call did not touch it. A role change that also
+      // reported a status would be claiming a second edit it did not make, and the
+      // status moves through `setMemberApproval`, which writes its own audit row.
+      from: normalizeRoles(
+        ((before ?? []) as unknown as { role: Role }[]).map((row) => row.role),
+      ),
+      to: normalizeRoles(input.roles),
+    },
+  });
+}
+
+/**
+ * Approve, suspend or expel somebody without touching their roles.
+ *
+ * A separate function from `setMemberRoles` because the two are edited in
+ * different places and for different reasons: roles are a hat, status is
+ * membership. Passing a client's idea of somebody's roles along with a status
+ * change would also mean a stale role list could quietly overwrite a promotion
+ * that happened in another tab, and nothing about "approve this applicant" wants
+ * that risk.
+ */
+export async function setMemberApproval(
+  steamId: string,
+  status: AccountProfile["status"],
+): Promise<void> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.setRole");
+
+  const { data: target, error: readError } = await getSupabaseAdmin()
+    .from("profiles")
+    .select("status")
+    .eq("steam_id", steamId)
+    .maybeSingle();
+
+  if (readError) throw queryError("Не удалось прочитать участника", readError);
+  if (!target) throw new Error("Участник не найден");
+
+  const { error } = await getSupabaseAdmin()
+    .from("profiles")
+    .update({
+      status,
+      approved_at: status === "approved" ? new Date().toISOString() : null,
+    })
+    .eq("steam_id", steamId);
+
+  if (error) throw queryError("Не удалось изменить статус", error);
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "profile.setRole",
+    entity: "profiles",
+    entityId: steamId,
+    meta: { from: { status: (target as { status: string }).status }, to: { status } },
+  });
+}
+
+/** Add one role to a member. The `+ Добавить роль` button. */export async function addMemberRole(steamId: string, role: Role): Promise<void> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.setRole");
+
+  const targetRoles = await readRoleSet(steamId);
+  if (targetRoles.length === 0) throw new Error("Участник не найден");
+
+  const verdict = canChangeRoles({
+    actorRoles: actor.roles,
+    targetRoles,
+    change: { kind: "add", role },
+    counts: { topStandingCount: await countTopStanding() },
+  });
+
+  if (!verdict.ok) throw new Error(verdict.reason);
+
+  const { error } = await getSupabaseAdmin().rpc("add_profile_role", {
+    p_steam_id: steamId,
+    p_role: role,
+    p_actor: actor.steamId,
+  });
+
+  if (error) throw queryError("Не удалось назначить роль", error);
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "profile.setRole",
+    entity: "profile_role_assignments",
+    entityId: steamId,
+    meta: { from: targetRoles, to: applyChange(targetRoles, { kind: "add", role }) },
+  });
+}
+
+/** Take one role away from a member. The `×` on a badge. */
+export async function removeMemberRole(steamId: string, role: Role): Promise<void> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.setRole");
+
+  const targetRoles = await readRoleSet(steamId);
+  if (targetRoles.length === 0) throw new Error("Участник не найден");
+
+  const verdict = canChangeRoles({
+    actorRoles: actor.roles,
+    targetRoles,
+    change: { kind: "remove", role },
+    counts: { topStandingCount: await countTopStanding() },
+  });
+
+  if (!verdict.ok) throw new Error(verdict.reason);
+
+  const { error } = await getSupabaseAdmin().rpc("remove_profile_role", {
+    p_steam_id: steamId,
+    p_role: role,
+    p_actor: actor.steamId,
+  });
+
+  if (error) throw queryError("Не удалось снять роль", error);
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "profile.setRole",
+    entity: "profile_role_assignments",
+    entityId: steamId,
+    meta: { from: targetRoles, to: applyChange(targetRoles, { kind: "remove", role }) },
   });
 }
 
@@ -287,7 +468,7 @@ export async function setMemberRole(input: {
  * Deliberately narrower than `updateAccountProfile`: an admin fixing a typo in
  * somebody's character name may correct the *naming* fields, but `role`,
  * `status`, `approved_at` and every contact field stay out of reach here. Role
- * changes go through `setMemberRole` (leader only) and contacts are the
+ * changes go through `setMemberRoles` (leader or admin) and contacts are the
  * member's own business. An endpoint that could write `role` and was merely
  * mounted behind a staff check would quietly become a second, weaker way to
  * appoint leaders, and there would be no way to tell the two apart later in the
@@ -299,7 +480,7 @@ export async function updateMemberProfile(input: {
   about: string;
 }): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "profile.editAny")) throw new SessionError("forbidden");
+  await assertCan(actor, "profile.editAny");
 
   const displayName = input.displayName.trim().slice(0, 60);
   if (displayName.length === 0) throw new Error("Имя не может быть пустым");
@@ -342,7 +523,11 @@ export async function updateMemberProfile(input: {
  *
  *   - `status` -> 'rejected', which is the state `requireSession()` refuses, so
  *     every portal read and write fails for them from their next request on;
- *   - `role` -> 'member', so a removed admin cannot keep an outranking role;
+ *   - every row in `profile_role_assignments` deleted, so a removed admin cannot
+ *     keep an outranking role. This goes through the RPC rather than a direct
+ *     delete so the trigger refreshes the cache column in the same transaction —
+ *     the column is derived, and a hand-written delete that forgot it would leave
+ *     `profiles.role` claiming a leadership nobody has;
  *   - `approved_at` -> null, so the removal is visible in the profile itself and
  *     re-approval cannot silently reuse a stale timestamp.
  *
@@ -351,14 +536,17 @@ export async function updateMemberProfile(input: {
  * signing in again leaves them removed rather than resurrecting them, and they
  * may file a fresh application through /join instead.
  *
- * Two guards, because both mistakes are unrecoverable through the UI:
+ * Three guards, because all three mistakes are unrecoverable through the UI:
  *   - a staff member cannot expel themselves, which would strand the account;
- *   - the last leader cannot be expelled, which would leave nobody able to
- *     appoint a leader again — the portal's own recovery path would be gone.
+ *   - an admin cannot be expelled at all, since that would strip the role the
+ *     interface is not allowed to touch;
+ *   - the last person who can appoint cannot be expelled, which would leave
+ *     nobody able to appoint a leader again — the portal's own recovery path
+ *     would be gone.
  */
 export async function removeMember(input: { steamId: string; reason: string }): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "profile.remove")) throw new SessionError("forbidden");
+  await assertCan(actor, "profile.remove");
 
   if (input.steamId === actor.steamId) {
     throw new Error("Нельзя исключить самого себя");
@@ -366,13 +554,14 @@ export async function removeMember(input: { steamId: string; reason: string }): 
 
   const { data: target } = await getSupabaseAdmin()
     .from("profiles")
-    .select("role, status, display_name, persona")
+    .select("status, display_name, persona")
     .eq("steam_id", input.steamId)
     .maybeSingle();
 
   if (!target) throw new Error("Участник не найден");
 
-  const targetRow = target as { role: Role; status: string; display_name: string; persona: string };
+  const targetRow = target as { status: string; display_name: string; persona: string };
+  const targetRoles = await readRoleSet(input.steamId);
 
   if (targetRow.status !== "approved") {
     // Distinguish the two non-approved states rather than lumping them together:
@@ -387,25 +576,39 @@ export async function removeMember(input: { steamId: string; reason: string }): 
     );
   }
 
-  if (targetRow.role === "leader") {
-    const { data: leaders, error: leadersError } = await getSupabaseAdmin()
-      .from("profiles")
-      .select("steam_id")
-      .eq("role", "leader")
-      .eq("status", "approved");
+  if (targetRoles.includes("admin")) {
+    // Expelling somebody is the same act as demoting them, because the roles are
+    // cleared below. Without this check, the rule that the admin role is not
+    // touched through the interface would be bypassed by the one button that
+    // looks like it only changes membership status.
+    throw new Error("Роль админа меняется только напрямую в базе данных");
+  }
 
-    if (leadersError) throw queryError(`Не удалось проверить состав лидеров`, leadersError);
-    if ((leaders ?? []).length <= 1) {
-      throw new Error("Нельзя исключить последнего лидера");
-    }
+  if (targetRoles.some(isAppointer) && (await countTopStanding()) <= 1) {
+    throw new Error("Нельзя исключить последнего лидера или админа");
   }
 
   const reason = input.reason.trim().slice(0, 500);
   if (reason.length === 0) throw new Error("Укажите причину исключения");
 
+  // Clear the titles first. Doing it in this order means there is no window in
+  // which somebody rejected from the party still holds a role: were it the other
+  // way round, an account that is already locked out of the portal could still be
+  // counted as an appointable member, which is what the guard above measures.
+  if (targetRoles.length > 0) {
+    const { error: roleError } = await getSupabaseAdmin().rpc("set_profile_roles", {
+      p_steam_id: input.steamId,
+      // An empty set, not `["member"]`: the RPC stores appointments only.
+      p_roles: [],
+      p_actor: actor.steamId,
+    });
+
+    if (roleError) throw queryError("Не удалось снять роли участника", roleError);
+  }
+
   const { error } = await getSupabaseAdmin()
     .from("profiles")
-    .update({ status: "rejected", role: "member", approved_at: null })
+    .update({ status: "rejected", approved_at: null })
     .eq("steam_id", input.steamId);
 
   if (error) throw queryError(`Не удалось исключить участника`, error);
@@ -415,7 +618,7 @@ export async function removeMember(input: { steamId: string; reason: string }): 
     action: "profile.remove",
     entity: "profiles",
     entityId: input.steamId,
-    meta: { from: { role: targetRow.role, status: targetRow.status }, reason },
+    meta: { from: { roles: targetRoles, status: targetRow.status }, reason },
   });
 }
 
@@ -454,7 +657,7 @@ export async function replaceOwnAvailability(
   slots: Array<{ weekday: number; fromMin: number; toMin: number }>,
 ): Promise<AvailabilitySlot[]> {
   const session = await requireSession();
-  if (!can(session.role, "availability.editOwn")) throw new SessionError("forbidden");
+  await assertCan(session, "availability.editOwn");
 
   const admin = getSupabaseAdmin();
 
@@ -495,14 +698,16 @@ export async function replaceOwnAvailability(
 
 /** The "who is free when" grid. Staff only — it exposes every member's week. */
 export async function getAvailabilityMatrix(): Promise<AvailabilityMatrixRow[]> {
-  await requireStaff();
+  await requirePermission("availability.viewAll");
   const admin = getSupabaseAdmin();
 
+  // No `role` column: see the note on `ACCOUNT_COLUMNS`. The grid shows a stack of
+  // badges, and it can only show what the assignment rows say.
   const [{ data: people, error: peopleError }, { data: slots, error: slotsError }] =
     await Promise.all([
       admin
         .from("profiles")
-        .select("steam_id, display_name, persona, role, status")
+        .select("steam_id, display_name, persona, status")
         .order("display_name", { ascending: true }),
       admin.from("member_availability").select("steam_id, weekday, from_min, to_min"),
     ]);
@@ -524,15 +729,22 @@ export async function getAvailabilityMatrix(): Promise<AvailabilityMatrixRow[]> 
     byMember.set(steamId, list);
   }
 
-  return ((people ?? []) as unknown as Array<Record<string, unknown>>).map((row) => ({
-    steamId: String(row.steam_id),
-    name: displayNameOf({ displayName: String(row.display_name ?? ""), persona: String(row.persona ?? "") }),
-    role: row.role as Role,
-    status: row.status as AvailabilityMatrixRow["status"],
-    slots: (byMember.get(String(row.steam_id)) ?? []).sort(
-      (a, b) => a.weekday - b.weekday || a.fromMin - b.fromMin,
-    ),
-  }));
+  const peopleRows = (people ?? []) as unknown as Array<Record<string, unknown>>;
+  const roleSets = await readRoleSets(peopleRows.map((row) => String(row.steam_id)));
+
+  return peopleRows.map((row) => {
+    const roles = normalizeRoles(roleSets.get(String(row.steam_id)) ?? []);
+    return {
+      steamId: String(row.steam_id),
+      name: displayNameOf({ displayName: String(row.display_name ?? ""), persona: String(row.persona ?? "") }),
+      roles,
+      role: roles[0],
+      status: row.status as AvailabilityMatrixRow["status"],
+      slots: (byMember.get(String(row.steam_id)) ?? []).sort(
+        (a, b) => a.weekday - b.weekday || a.fromMin - b.fromMin,
+      ),
+    };
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -684,6 +896,7 @@ function toEventRecord(
     closedBy: (row.closed_by as string | null) ?? null,
     state: eventState(status, startsAt, endsAt, now),
     deletedAt: (row.deleted_at as string | null) ?? null,
+    createdBy: (row.created_by as string | null) ?? null,
   };
 }
 
@@ -708,16 +921,19 @@ function toRegistryEntry(
   row: Record<string, unknown>,
   viewer: { staff: boolean; viewerId: string },
   hours: { totalHours: number; eventsAttended: number; eventsAbsent: number },
+  roles: Role[],
 ): RegistryEntry {
   const steamId = String(row.steam_id);
   const contactsPublic = Boolean(row.contacts_public);
   const maySee = viewer.staff || contactsPublic || steamId === viewer.viewerId;
+  const held = normalizeRoles(roles);
 
   return {
     steamId,
     displayName: String(row.display_name ?? ""),
     persona: String(row.persona ?? ""),
-    role: row.role as Role,
+    roles: held,
+    role: held[0],
     status: row.status as ApprovalStatus,
     about: String(row.about ?? ""),
     telegram: maySee ? ((row.telegram as string | null) ?? null) : null,
@@ -797,7 +1013,9 @@ async function loadDeclines(
 /** Events a staff member hid, so they can be brought back. Staff only. */
 export async function listDeletedEvents(): Promise<EventWithAttendance[]> {
   const actor = await requireSession();
-  if (!can(actor.role, "event.delete")) throw new SessionError("forbidden");
+  // Reading the trash is part of being able to delete, not a separate power: an
+  // event cannot be restored by someone who may not delete.
+  await assertCan(actor, "event.deleteAny");
 
   const admin = getSupabaseAdmin();
   if (!(await hasDeletedAtColumn(admin))) return [];
@@ -864,25 +1082,32 @@ export async function listDeletedEvents(): Promise<EventWithAttendance[]> {
 
 export async function listEvents(): Promise<EventWithAttendance[]> {
   const session = await requireSession();
-  const staff = can(session.role, "event.edit");
+  const staff = await canAct(session, "event.editAny");
   const now = Date.now();
 
   const admin = getSupabaseAdmin();
 
   const withDeletedAt = await hasDeletedAtColumn(admin);
-  let query = admin
-    .from("party_events")
-    .select(
-      eventColumnsWith(await hasCreatedByColumn(admin), withDeletedAt),
-    );
+  const withCreatedBy = await hasCreatedByColumn(admin);
+  let query = admin.from("party_events").select(eventColumnsWith(withCreatedBy, withDeletedAt));
 
   if (withDeletedAt) query = query.is("deleted_at", null);
 
-  if (!staff) {
+  if (!staff && withCreatedBy) {
     // `is_published` alone is not enough. Publication is a separate switch from
     // status, so a draft that someone ticked "publish" on would otherwise be
     // listed to every member — the opposite of what a draft is for. Non-staff
     // always see open and finished events, never drafts.
+    //
+    // Their *own* drafts are the exception, or an event would have to be
+    // published the instant it was created and there would be no way to prepare
+    // one privately. The alternative shape — a second query for the caller's rows,
+    // then a merge — was avoided because it duplicates the ordering and the
+    // attendance join below; PostgREST's `or` keeps one result set.
+    query = query.or(
+      `and(is_published.eq.true,status.neq.draft),created_by.eq.${session.steamId}`,
+    );
+  } else if (!staff) {
     query = query.eq("is_published", true).neq("status", "draft");
   }
 
@@ -948,17 +1173,40 @@ export async function listEvents(): Promise<EventWithAttendance[]> {
 /** Create or edit an event. Staff only. */
 export async function upsertEvent(input: EventUpsertInput): Promise<EventRecord> {
   const actor = await requireSession();
-  if (!can(actor.role, "event.create")) throw new SessionError("forbidden");
-
-  if (input.endsAt && new Date(input.endsAt) <= new Date(input.startsAt)) {
-    throw new Error("Окончание должно быть позже начала");
-  }
-
   const admin = getSupabaseAdmin();
   // On a database that predates the column the event is still created, just
   // without an author. Refusing to schedule anything until a migration is applied
   // would be a far worse trade than a missing name.
   const withAuthor = await hasCreatedByColumn(admin);
+
+  if (input.id) {
+    // Editing is not creating. The person who scheduled an event keeps the right
+    // to fix a typo in it on the strength of `event.create` — the same permission
+    // that let them write it in the first place — and editing somebody else's
+    // needs `event.editAny` on top. Reading the row first is unavoidable: who owns
+    // an event is a fact about the event.
+    const { data: existing, error: readError } = await admin
+      .from("party_events")
+      .select(withAuthor ? "created_by" : "id")
+      .eq("id", input.id)
+      .maybeSingle();
+    if (readError) throw queryError("Не удалось прочитать мероприятие", readError);
+    if (!existing) throw new Error("Мероприятие не найдено");
+
+    const isAuthor =
+      withAuthor && (existing as { created_by?: string | null }).created_by === actor.steamId;
+    const asOrganiser = isAuthor && (await canAct(actor, "event.create"));
+    if (!(await canAct(actor, "event.editAny")) && !asOrganiser) {
+      throw new SessionError("forbidden");
+    }
+  } else {
+    await assertCan(actor, "event.create");
+  }
+
+  if (input.endsAt && new Date(input.endsAt) <= new Date(input.startsAt)) {
+    throw new Error("Окончание должно быть позже начала");
+  }
+
   const payload = {
     // Truncated rather than rejected so a paste that overruns by a character does
     // not lose the whole event, but the bound is a real one: the card on the
@@ -1019,7 +1267,7 @@ export async function upsertEvent(input: EventUpsertInput): Promise<EventRecord>
  */
 export async function setOwnRsvp(input: RsvpInput): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "event.rsvp")) throw new SessionError("forbidden");
+  await assertCan(session, "event.rsvp");
 
   const admin = getSupabaseAdmin();
 
@@ -1140,7 +1388,7 @@ export async function recordAttendance(input: {
   totalHours?: number | null;
 }): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "event.close")) throw new SessionError("forbidden");
+  await assertCan(actor, "event.close");
 
   const admin = getSupabaseAdmin();
 
@@ -1230,9 +1478,8 @@ export async function recordAttendance(input: {
  */
 export async function deleteEvent(id: string): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "event.delete")) throw new SessionError("forbidden");
-
   const admin = getSupabaseAdmin();
+
   if (!(await hasDeletedAtColumn(admin))) {
     throw queryError("Не удалось удалить мероприятие", {
       code: "42703",
@@ -1240,15 +1487,34 @@ export async function deleteEvent(id: string): Promise<void> {
     });
   }
 
+  // Read before deciding, because "may I" is now a question about the row and not
+  // only about the caller. `created_by` is probed rather than assumed: a member
+  // who created an event may remove it, and a database that predates the column
+  // has nobody to attribute those rows to.
+  const withCreatedBy = await hasCreatedByColumn(admin);
   const { data: before, error: readError } = await admin
     .from("party_events")
-    .select("status, is_published, deleted_at")
+    .select(`status, is_published, deleted_at${withCreatedBy ? ", created_by" : ""}`)
     .eq("id", id)
     .maybeSingle();
   if (readError) throw queryError("Не удалось удалить мероприятие", readError);
   if (!before) throw new Error("Мероприятие не найдено");
 
-  const previous = before as { status: string; is_published: boolean; deleted_at: string | null };
+  const previous = before as unknown as {
+    status: string;
+    is_published: boolean;
+    deleted_at: string | null;
+    created_by?: string | null;
+  };
+
+  // An event with no `created_by` was written before members could create events,
+  // so nobody owns it and it stays staff-only. Treated as staff-only rather than
+  // as orphaned: a null author is not evidence of permission.
+  const isAuthor = withCreatedBy && previous.created_by === actor.steamId;
+  if (!(await canAct(actor, "event.deleteAny")) && !isAuthor) {
+    throw new SessionError("forbidden");
+  }
+
   if (previous.deleted_at) return;
 
   const { error } = await admin
@@ -1259,7 +1525,9 @@ export async function deleteEvent(id: string): Promise<void> {
 
   await writeAudit({
     actor: actor.steamId,
-    action: "event.delete",
+    // As with work points: the log records a removal, and the permission that
+    // permits one is the `Any` variant, staff or not.
+    action: "event.deleteAny",
     entity: "party_events",
     entityId: id,
     meta: {
@@ -1270,10 +1538,13 @@ export async function deleteEvent(id: string): Promise<void> {
   });
 }
 
-/** Bring a hidden event back. Staff only, reusing `event.edit`. */
+/** Bring a hidden event back. Staff only, reusing `event.editAny`. */
 export async function restoreEvent(id: string): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "event.edit")) throw new SessionError("forbidden");
+  // Restoring is not available to the event's own author: `deleteEvent` hides a row
+  // precisely so staff can look at it, and letting the author undo the hide would
+  // make the trash unreviewable.
+  await assertCan(actor, "event.editAny");
 
   const admin = getSupabaseAdmin();
   if (!(await hasDeletedAtColumn(admin))) {
@@ -1332,7 +1603,7 @@ async function listAppealsRows(): Promise<AppealRow[]> {
 
 export async function listAppeals(): Promise<AppealRecord[]> {
   const session = await requireSession();
-  if (!can(session.role, "appeal.create")) throw new SessionError("forbidden");
+  await assertCan(session, "appeal.create");
 
   const rows = await listAppealsRows();
   const names = await loadMemberNames(rows.map((row) => row.author));
@@ -1354,7 +1625,7 @@ export async function listAppeals(): Promise<AppealRecord[]> {
 
 export async function createAppeal(input: { title: string; body: string }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "appeal.create")) throw new SessionError("forbidden");
+  await assertCan(session, "appeal.create");
 
   const title = input.title.trim();
   const body = input.body.trim();
@@ -1389,7 +1660,7 @@ export async function setAppealStatus(input: {
   status: AppealStatus;
 }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "appeal.setStatus")) throw new SessionError("forbidden");
+  await assertCan(session, "appeal.setStatus");
 
   const rows = await listAppealsRows();
   const target = rows.find((row) => String(row.id) === input.id);
@@ -1420,7 +1691,7 @@ export async function setAppealStatus(input: {
 /** Staff reply. Staff only, unlike the status change above. */
 export async function setAppealReply(input: { id: string; reply: string }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "appeal.reply")) throw new SessionError("forbidden");
+  await assertCan(session, "appeal.reply");
 
   const reply = input.reply.trim().slice(0, 5000) || null;
   const { error } = await getSupabaseAdmin()
@@ -1459,8 +1730,9 @@ export async function deleteAppeal(id: string): Promise<void> {
   const row = data as { author: string; status: string };
 
   const isAuthor = row.author === session.steamId;
-  const asStaff = can(session.role, "appeal.deleteAny");
-  const asOwner = can(session.role, "appeal.deleteOwn", { isAuthor }) && isAppealOpen(row.status);
+  const asStaff = await canAct(session, "appeal.deleteAny");
+  const asOwner =
+    (await canAct(session, "appeal.deleteOwn", { isAuthor })) && isAppealOpen(row.status);
 
   if (!asStaff && !asOwner) throw new SessionError("forbidden");
 
@@ -1482,7 +1754,7 @@ export async function deleteAppeal(id: string): Promise<void> {
 
 export async function listPolls(): Promise<PollRecord[]> {
   const session = await requireSession();
-  if (!can(session.role, "poll.create")) throw new SessionError("forbidden");
+  await assertCan(session, "poll.create");
 
   const admin = getSupabaseAdmin();
 
@@ -1580,7 +1852,7 @@ export async function createPoll(input: {
   options: string[];
 }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "poll.create")) throw new SessionError("forbidden");
+  await assertCan(session, "poll.create");
 
   const question = input.question.trim();
   const labels = input.options.map((option) => option.trim()).filter((option) => option.length > 0);
@@ -1640,7 +1912,7 @@ export async function voteInPoll(input: {
   optionIds: string[];
 }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "poll.vote")) throw new SessionError("forbidden");
+  await assertCan(session, "poll.vote");
 
   const admin = getSupabaseAdmin();
 
@@ -1696,7 +1968,7 @@ export async function setPollStatus(input: {
   status: "open" | "closed";
 }): Promise<void> {
   const session = await requireSession();
-  if (!can(session.role, "poll.close")) throw new SessionError("forbidden");
+  await assertCan(session, "poll.close");
 
   const { error } = await getSupabaseAdmin()
     .from("polls")
@@ -1727,9 +1999,9 @@ export async function deletePoll(pollId: string): Promise<void> {
   const row = data as { author: string; status: string };
 
   const isAuthor = row.author === session.steamId;
-  const asStaff = can(session.role, "poll.deleteAny");
+  const asStaff = await canAct(session, "poll.deleteAny");
   const asOwner =
-    can(session.role, "poll.deleteOwn", { isAuthor }) && isPollOpen(row.status);
+    (await canAct(session, "poll.deleteOwn", { isAuthor })) && isPollOpen(row.status);
 
   if (!asStaff && !asOwner) throw new SessionError("forbidden");
 
@@ -1751,10 +2023,17 @@ export async function deletePoll(pollId: string): Promise<void> {
 
 export async function listWorkPoints(): Promise<WorkPointRecord[]> {
   const session = await requireSession();
-  const staff = can(session.role, "point.edit");
+  const staff = await canAct(session, "point.editAny");
 
   let query = getSupabaseAdmin().from("work_points").select("*");
-  if (!staff) query = query.eq("status", "published");
+  // Members see published points plus their own drafts, for the same reason they
+  // see their own event drafts: `point.create` is granted to whoever maintains the
+  // map, and a half-finished marker should not be visible to the whole party until
+  // it is ready. One query rather than a merge, so the ordering and the name
+  // lookup below stay single-passed.
+  if (!staff) {
+    query = query.or(`status.eq.published,created_by.eq.${session.steamId}`);
+  }
 
   const { data, error } = await query.order("created_at", { ascending: false });
   if (error) throw queryError(`Не удалось прочитать точки`, error);
@@ -1782,8 +2061,28 @@ export async function listWorkPoints(): Promise<WorkPointRecord[]> {
 
 export async function upsertWorkPoint(input: WorkPointInput): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, input.id ? "point.edit" : "point.create")) {
-    throw new SessionError("forbidden");
+  const admin = getSupabaseAdmin();
+
+  if (input.id) {
+    // Editing is not creating: the person who marked a point may fix it on the
+    // strength of `point.create`, and changing somebody else's marker needs
+    // `point.editAny`. Ownership is read from the row, so this cannot be a
+    // header-level check.
+    const { data: existing, error: readError } = await admin
+      .from("work_points")
+      .select("created_by")
+      .eq("id", input.id)
+      .maybeSingle();
+    if (readError) throw queryError("Не удалось прочитать точку", readError);
+    if (!existing) throw new Error("Точка не найдена");
+
+    const isAuthor = (existing as { created_by?: string | null }).created_by === actor.steamId;
+    const asAuthor = isAuthor && (await canAct(actor, "point.create"));
+    if (!(await canAct(actor, "point.editAny")) && !asAuthor) {
+      throw new SessionError("forbidden");
+    }
+  } else {
+    await assertCan(actor, "point.create");
   }
 
   const title = input.title.trim();
@@ -1801,7 +2100,6 @@ export async function upsertWorkPoint(input: WorkPointInput): Promise<void> {
     status: input.status,
   };
 
-  const admin = getSupabaseAdmin();
   const query = input.id
     ? admin.from("work_points").update(payload).eq("id", input.id)
     : admin.from("work_points").insert({ ...payload, created_by: actor.steamId });
@@ -1819,14 +2117,30 @@ export async function upsertWorkPoint(input: WorkPointInput): Promise<void> {
 
 export async function deleteWorkPoint(id: string): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "point.delete")) throw new SessionError("forbidden");
+
+  const { data: existing, error: readError } = await getSupabaseAdmin()
+    .from("work_points")
+    .select("created_by")
+    .eq("id", id)
+    .maybeSingle();
+  if (readError) throw queryError("Не удалось прочитать точку", readError);
+  if (!existing) throw new Error("Точка не найдена");
+
+  const isAuthor = (existing as { created_by?: string | null }).created_by === actor.steamId;
+  const asAuthor = isAuthor && (await canAct(actor, "point.create"));
+  if (!(await canAct(actor, "point.deleteAny")) && !asAuthor) {
+    throw new SessionError("forbidden");
+  }
 
   const { error } = await getSupabaseAdmin().from("work_points").delete().eq("id", id);
   if (error) throw queryError(`Не удалось удалить точку`, error);
 
   await writeAudit({
     actor: actor.steamId,
-    action: "point.delete",
+    // The moderation vocabulary, not the old one: a reader of the audit log
+    // filtering on `point.deleteAny` is asking "who removed a point", which is
+    // the only delete this column has ever recorded.
+    action: "point.deleteAny",
     entity: "work_points",
     entityId: id,
   });
@@ -1871,7 +2185,11 @@ async function hasHoursTable(): Promise<boolean> {
  * has to show *why* a member's figure differs from the events they attended.
  */
 export async function listHoursAdjustments(steamId: string): Promise<HoursAdjustmentRecord[]> {
-  await requireSession();
+  // The corrections that produced somebody's hour total are a moderation record,
+  // not a public figure. This had no check at all while the registry rendered the
+  // list for anyone who could open the registry — the same screen that could
+  // correct hours, which is `registry.editHours`.
+  await requirePermission("registry.editHours");
   if (!(await hasHoursTable())) return [];
 
   const { data, error } = await getSupabaseAdmin()
@@ -1919,7 +2237,7 @@ export async function addHoursAdjustment(input: {
   reason: string;
 }): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "registry.editHours")) throw new SessionError("forbidden");
+  await assertCan(actor, "registry.editHours");
 
   if (!Number.isFinite(input.hours) || input.hours === 0) {
     throw new Error("Укажите количество часов");
@@ -1975,7 +2293,7 @@ export async function addHoursAdjustment(input: {
 /** Withdraw a correction entirely. Staff only. */
 export async function deleteHoursAdjustment(id: number): Promise<void> {
   const actor = await requireSession();
-  if (!can(actor.role, "registry.editHours")) throw new SessionError("forbidden");
+  await assertCan(actor, "registry.editHours");
 
   if (!(await hasHoursTable())) return;
 
@@ -2049,9 +2367,15 @@ async function getMemberHoursTotal(steamId: string): Promise<number> {
  */
 export async function listRegistry(): Promise<RegistryEntry[]> {
   const session = await requireSession();
-  if (!can(session.role, "registry.view")) throw new SessionError("forbidden");
+  await assertCan(session, "registry.view");
 
-  const staff = can(session.role, "report.viewAll");
+  // Whether the caller sees contact detail. This used to be keyed off
+  // `report.viewAll`, which is a different question — reading somebody's hours is
+  // not what entitles you to their phone number — so a custom role built for
+  // "secretary" had to be handed report access to see an address book.
+  // `profile.editAny` is the permission that is actually about other people's
+  // details, contact fields included.
+  const staff = await canAct(session, "profile.editAny");
   const admin = getSupabaseAdmin();
 
   // `profiles` is the base of the registry and `member_hours_totals` is joined onto
@@ -2061,9 +2385,11 @@ export async function listRegistry(): Promise<RegistryEntry[]> {
   // those members in the list: the earlier version only fell back when the view was
   // *entirely* empty, so a party that had worked one event showed everybody except
   // the volunteers who had not made it to that one.
+  // No `role`: it is the cache column and can only name the highest role. The
+  // badges on a registry card come from the assignment rows.
   const { data: people, error: peopleError } = await admin
     .from("profiles")
-    .select("steam_id, display_name, persona, role, status, about, telegram, discord, phone, contacts_public, created_at, approved_at")
+    .select("steam_id, display_name, persona, status, about, telegram, discord, phone, contacts_public, created_at, approved_at")
     .order("created_at", { ascending: true });
 
   if (peopleError) throw queryError(`Failed to read profiles`, peopleError);
@@ -2126,11 +2452,15 @@ export async function listRegistry(): Promise<RegistryEntry[]> {
     });
   }
 
-  const entries = ((people ?? []) as unknown as Array<Record<string, unknown>>).map((row) =>
+  const peopleRows = (people ?? []) as unknown as Array<Record<string, unknown>>;
+  const roleSets = await readRoleSets(peopleRows.map((row) => String(row.steam_id)));
+
+  const entries = peopleRows.map((row) =>
     toRegistryEntry(
       row,
       { staff, viewerId: session.steamId },
       hoursById.get(String(row.steam_id)) ?? { totalHours: 0, eventsAttended: 0, eventsAbsent: 0 },
+      roleSets.get(String(row.steam_id)) ?? [],
     ),
   );
 
@@ -2173,7 +2503,7 @@ export async function getMyHours(): Promise<MyHours> {
 
 /** The audit trail. Staff only. */
 export async function listAudit(limit = 50): Promise<AuditEntry[]> {
-  await requireStaff();
+  await requirePermission("report.viewAll");
 
   const { data, error } = await getSupabaseAdmin()
     .from("audit_log")
@@ -2314,4 +2644,465 @@ export async function listPublicEvents(
     // entry rather than an empty name here.
     createdByName: createdBy ? (names.get(createdBy) ?? null) : null,
   }));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom roles                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether 003_custom_roles.sql has been applied.
+ *
+ * Memoised the same way `hasHoursTable` is, for the same reason: until the
+ * migration is run the role manager has nothing to read, and the correct answer
+ * is "no roles exist yet", not an error page. A console warning marks the window
+ * so it cannot pass unnoticed.
+ */
+let roleTableProbe: boolean | undefined;
+
+async function hasRoleTables(): Promise<boolean> {
+  if (roleTableProbe !== undefined) return roleTableProbe;
+
+  const { error } = await getSupabaseAdmin().from("custom_roles").select("id").limit(1);
+
+  if (error && !isMissingObject(error)) {
+    throw queryError("Не удалось проверить таблицу ролей", error);
+  }
+
+  roleTableProbe = !isMissingObject(error);
+
+  if (!roleTableProbe) {
+    console.error(
+      "[portal] custom_roles is not present — the role manager will be empty. Apply supabase/migrations/003_custom_roles.sql.",
+    );
+  }
+
+  return roleTableProbe;
+}
+
+interface CustomRoleRow {
+  id: number;
+  key: string;
+  name: string;
+  description: string;
+  created_at: string;
+  // Element types carry no `null`: `embeddedList` is what strips it, and having
+  // it in both places makes every consumer of the result null-check again.
+  custom_role_permissions: Array<{ action: string }> | { action: string } | null;
+  /** PostgREST aggregate over the grant relation, when requested. */
+  profile_role_grants?: Array<{ count: number }> | { count: number } | null;
+}
+
+/**
+ * Read one embedded relation that PostgREST may return as an object or an array.
+ *
+ * The two shapes are the same data and guessing wrong reads as "no permissions",
+ * which in this file would mean quietly hiding every permission a role grants.
+ */
+function embeddedList<T>(value: T | T[] | null | undefined): T[] {
+  if (value == null) return [];
+  return Array.isArray(value) ? value.filter((item): item is T => item != null) : [value];
+}
+
+/**
+ * Reject an action list the caller is not allowed to hand out.
+ *
+ * Two independent rules, both server-side. `isGrantable` is the floor: unknown or
+ * non-delegable actions are dropped no matter who asks, so a hand-written insert
+ * or a future bug cannot smuggle `profile.setRole` into a role. `canGrantAll` is
+ * the ceiling: a role may only contain what its author already holds, so an admin
+ * can build anything up to admin and no further.
+ *
+ * Throwing rather than filtering-and-saving is deliberate. Silently dropping the
+ * one action the editor would not have offered is a worse outcome than an
+ * error: the person clicks "save", sees success, and later wonders why the role
+ * does not do what they built it to do.
+ */
+async function assertActionsGrantable(actor: ProfileDTO, actions: readonly string[]): Promise<Action[]> {
+  const valid: Action[] = [];
+  const rejected: string[] = [];
+
+  for (const action of actions) {
+    if (isGrantable(action)) valid.push(action);
+    else rejected.push(action);
+  }
+
+  if (rejected.length > 0) {
+    throw new Error(`Недопустимые права в роли: ${rejected.join(", ")}`);
+  }
+
+  if (!(await canGrantAll(actor, valid))) {
+    throw new Error("Нельзя выдать права, которых нет у вас самих");
+  }
+
+  return Array.from(new Set(valid));
+}
+
+/** Every custom role with its actions and holder count. */
+export async function listCustomRoles(): Promise<CustomRoleRecord[]> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  if (!(await hasRoleTables())) return [];
+
+  const { data, error } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .select("id, key, name, description, created_at, custom_role_permissions ( action ), profile_role_grants ( count )")
+    .order("name", { ascending: true });
+
+  if (error) throw queryError("Не удалось загрузить роли", error);
+
+  return ((data ?? []) as unknown as CustomRoleRow[]).map((row) => ({
+    id: row.id,
+    key: row.key,
+    name: row.name,
+    description: row.description,
+    createdAt: row.created_at,
+    actions: embeddedList(row.custom_role_permissions)
+      .map((item) => item.action)
+      .filter(isGrantable),
+    holderCount: embeddedList(row.profile_role_grants).reduce((sum, item) => sum + (item.count ?? 0), 0),
+  }));
+}
+
+/**
+ * Create a role.
+ *
+ * `key` is derived from the name when the caller does not supply one, and
+ * de-duplicated with a numeric suffix, because the CHECK constraint on `key`
+ * rejects anything outside `^[a-z0-9_]{2,40}$` and a Russian name transliterates
+ * to nothing useful on its own.
+ */
+export async function createCustomRole(input: {
+  name: string;
+  description: string;
+  actions: readonly string[];
+}): Promise<number> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  if (!(await hasRoleTables())) {
+    throw new Error("Таблицы ролей ещё не созданы. Примените 003_custom_roles.sql.");
+  }
+
+  const actions = await assertActionsGrantable(actor, input.actions);
+
+  if (input.actions.length === 0) throw new Error("Роль без прав бесполезна");
+  if (input.name.trim().length < 2) throw new Error("Слишком короткое название");
+
+  const { data: clash } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .select("key")
+    .like("key", `${slugify(input.name)}%`);
+
+  const taken = new Set(((clash ?? []) as Array<{ key: string }>).map((row) => row.key));
+  const base = slugify(input.name);
+  let key = base;
+  for (let suffix = 2; taken.has(key); suffix++) key = `${base}_${suffix}`;
+
+  const { data, error } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .insert({ key, name: input.name.trim(), description: input.description.trim() })
+    .select("id")
+    .single();
+
+  if (error) throw queryError("Не удалось создать роль", error);
+
+  const roleId = (data as { id: number }).id;
+
+  if (actions.length > 0) {
+    const { error: permError } = await getSupabaseAdmin()
+      .from("custom_role_permissions")
+      .insert(actions.map((action) => ({ role_id: roleId, action })));
+
+    if (permError) {
+      // Leave nothing half-made: a role row with no permissions would appear in
+      // the manager and grant nobody anything, which is the kind of invisible
+      // state that gets discovered months later.
+      await getSupabaseAdmin().from("custom_roles").delete().eq("id", roleId);
+      throw queryError("Не удалось сохранить права роли", permError);
+    }
+  }
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "role.create",
+    entity: "custom_roles",
+    entityId: roleId,
+    meta: { key, name: input.name, actions },
+  });
+
+  return roleId;
+}
+
+/** Rename a role or replace its permission set. `key` is deliberately immutable. */
+export async function updateCustomRole(input: {
+  roleId: number;
+  name: string;
+  description: string;
+  actions: readonly string[];
+}): Promise<void> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  const actions = await assertActionsGrantable(actor, input.actions);
+  if (input.name.trim().length < 2) throw new Error("Слишком короткое название");
+
+  const { error } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .update({ name: input.name.trim(), description: input.description.trim() })
+    .eq("id", input.roleId);
+
+  if (error) throw queryError("Не удалось изменить роль", error);
+
+  // Replace rather than merge. A role whose permissions are edited down to
+  // nothing while somebody holds it is a latent escalation: the permissions come
+  // back the next time the row is touched, for whoever still holds it.
+  const { error: deleteError } = await getSupabaseAdmin()
+    .from("custom_role_permissions")
+    .delete()
+    .eq("role_id", input.roleId);
+
+  if (deleteError) throw queryError("Не удалось обновить права роли", deleteError);
+
+  if (actions.length > 0) {
+    const { error: insertError } = await getSupabaseAdmin()
+      .from("custom_role_permissions")
+      .insert(actions.map((action) => ({ role_id: input.roleId, action })));
+
+    if (insertError) throw queryError("Не удалось обновить права роли", insertError);
+  }
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "role.update",
+    entity: "custom_roles",
+    entityId: input.roleId,
+    meta: { name: input.name, actions },
+  });
+}
+
+/**
+ * Delete a role. Its grants go with it.
+ *
+ * The UI warns with the holder count first. That is a courtesy, not the
+ * mechanism — the cascade is what makes the deletion consistent, and a role that
+ * outlives its permissions is worse than no role at all.
+ */
+export async function deleteCustomRole(roleId: number): Promise<void> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  const { data, error } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .delete()
+    .eq("id", roleId)
+    .select("key");
+
+  if (error) throw queryError("Не удалось удалить роль", error);
+  if (!data || (data as unknown[]).length === 0) throw new Error("Роль не найдена");
+
+  await writeAudit({
+    actor: actor.steamId,
+    action: "role.delete",
+    entity: "custom_roles",
+    entityId: roleId,
+    // No per-holder rows on purpose: the grants are gone, and the audit that
+    // matters is the one that records who decided to remove them.
+    meta: { key: (data as Array<{ key: string }>)[0].key },
+  });
+}
+
+/** Who holds what. `roleId` narrows it to one role; omit for the whole picture. */
+export async function listRoleGrants(roleId?: number): Promise<RoleGrantRecord[]> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  if (!(await hasRoleTables())) return [];
+
+  let query = getSupabaseAdmin()
+    .from("profile_role_grants")
+    .select(
+      // Both the FK constraint name *and* an alias are required. The constraint
+      // name alone leaves PostgREST resolving both embeds to the same internal
+      // relation and it answers 42712 "table name specified more than once"; the
+      // alias alone leaves it unable to choose between the two foreign keys and it
+      // answers PGRST201. Together they work. Verified against the live database.
+      "steam_id,granted_by,granted_at,custom_roles(id,key,name),holder:profiles!profile_role_grants_steam_id_fkey(display_name),granter:profiles!profile_role_grants_granted_by_fkey(display_name)",
+    );
+
+  if (roleId !== undefined) query = query.eq("role_id", roleId);
+
+  const { data, error } = await query.order("granted_at", { ascending: false });
+
+  if (error) throw queryError("Не удалось загрузить назначения ролей", error);
+
+  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map((row) => {
+    const role = row.custom_roles as { id: number; key: string; name: string } | null;
+
+    // PostgREST returns a to-one embed as an object, not an array, even for the
+    // aliased ones. `embeddedList` normalises the two, so the cast is the union
+    // rather than a lie about which one arrives.
+    const holder = row.holder as { display_name: string } | { display_name: string }[] | null;
+    const granter = row.granter as { display_name: string } | { display_name: string }[] | null;
+
+    return {
+      steamId: row.steam_id as string,
+      // Keyed by the select aliases, not by the relation name.
+      displayName: embeddedList(holder)[0]?.display_name ?? (row.steam_id as string),
+      roleId: role?.id ?? (roleId ?? 0),
+      roleKey: role?.key ?? "",
+      roleName: role?.name ?? "",
+      grantedBy: (row.granted_by as string | null) ?? null,
+      grantedByName: embeddedList(granter)[0]?.display_name ?? null,
+      grantedAt: row.granted_at as string,
+    };
+  });
+}
+
+/**
+ * Grant one role to many members at once.
+ *
+ * The whole batch is one audit row, not one per member. Both are defensible; this
+ * one is chosen because the interesting event is the decision, and forty rows of
+ * `role.grant` differing only in `steam_id` makes the audit log harder to read
+ * than the thing it records. The affected members are listed in `meta.steamIds`.
+ *
+ * Members who already hold the role come back in `skipped` rather than failing:
+ * the primary key would reject them, and a batch of twenty people where three
+ * were already set should not have to be retried to find that out.
+ */
+export async function grantCustomRole(input: {
+  roleId: number;
+  steamIds: readonly string[];
+}): Promise<RoleGrantResult> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  if (!(await hasRoleTables())) {
+    throw new Error("Таблицы ролей ещё не созданы. Примените 003_custom_roles.sql.");
+  }
+
+  const unique = Array.from(new Set(input.steamIds.map((id) => id.trim()).filter(Boolean)));
+  if (unique.length === 0) return { applied: [], skipped: [] };
+
+  const { data: role } = await getSupabaseAdmin()
+    .from("custom_roles")
+    .select("id, key, name")
+    .eq("id", input.roleId)
+    .maybeSingle();
+
+  if (!role) throw new Error("Роль не найдена");
+
+  const { data: existing } = await getSupabaseAdmin()
+    .from("profile_role_grants")
+    .select("steam_id")
+    .eq("role_id", input.roleId)
+    .in("steam_id", unique);
+
+  const already = new Set(((existing ?? []) as Array<{ steam_id: string }>).map((row) => row.steam_id));
+  const toApply = unique.filter((id) => !already.has(id));
+
+  if (toApply.length > 0) {
+    const { error } = await getSupabaseAdmin().from("profile_role_grants").insert(
+      toApply.map((steamId) => ({
+        steam_id: steamId,
+        role_id: input.roleId,
+        granted_by: actor.steamId,
+      })),
+    );
+
+    // A FK violation here means one of the ids is not a member; report it by
+    // name rather than as a raw constraint message.
+    if (error) throw queryError("Не удалось назначить роль: проверьте, что все участники существуют", error);
+  }
+
+  const result = { applied: toApply, skipped: unique.filter((id) => already.has(id)) };
+
+  if (result.applied.length > 0) {
+    await writeAudit({
+      actor: actor.steamId,
+      action: "role.grant",
+      entity: "profile_role_grants",
+      entityId: input.roleId,
+      meta: { roleKey: (role as { key: string }).key, steamIds: result.applied, count: result.applied.length },
+    });
+  }
+
+  return result;
+}
+
+/** Take one role away from many members. Same batch semantics as `grantCustomRole`. */
+export async function revokeCustomRole(input: {
+  roleId: number;
+  steamIds: readonly string[];
+}): Promise<RoleGrantResult> {
+  const actor = await requireSession();
+  await assertCan(actor, "profile.grantRole");
+
+  const unique = Array.from(new Set(input.steamIds.map((id) => id.trim()).filter(Boolean)));
+  if (unique.length === 0) return { applied: [], skipped: [] };
+
+  const { data: deleted, error } = await getSupabaseAdmin()
+    .from("profile_role_grants")
+    .delete()
+    .eq("role_id", input.roleId)
+    .in("steam_id", unique)
+    .select("steam_id");
+
+  if (error) throw queryError("Не удалось снять роль", error);
+
+  const applied = ((deleted ?? []) as Array<{ steam_id: string }>).map((row) => row.steam_id);
+  const removed = new Set(applied);
+  const result = { applied, skipped: unique.filter((id) => !removed.has(id)) };
+
+  if (result.applied.length > 0) {
+    const { data: role } = await getSupabaseAdmin()
+      .from("custom_roles")
+      .select("key")
+      .eq("id", input.roleId)
+      .maybeSingle();
+
+    await writeAudit({
+      actor: actor.steamId,
+      action: "role.revoke",
+      entity: "profile_role_grants",
+      entityId: input.roleId,
+      meta: {
+        roleKey: (role as { key: string } | null)?.key ?? null,
+        steamIds: result.applied,
+        count: result.applied.length,
+      },
+    });
+  }
+
+  return result;
+}
+
+/**
+ * ASCII slug for the storage key.
+ *
+ * Transliteration covers the Russian alphabet so a role named in Russian gets a
+ * stable, readable key; anything unrecognised is dropped rather than encoded, and
+ * the caller de-duplicates against a numeric suffix. A role whose name is entirely
+ * untransliterable ends up keyed `role_2`, which is fine: the key is never shown.
+ */
+function slugify(name: string): string {
+  const table: Record<string, string> = {
+    а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "e", ж: "zh", з: "z",
+    и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o", п: "p", р: "r",
+    с: "s", т: "t", у: "u", ф: "f", х: "h", ц: "c", ч: "ch", ш: "sh", щ: "sch",
+    ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya",
+  };
+
+  const slug = name
+    .toLowerCase()
+    .split("")
+    .map((char) => (char in table ? table[char] : char))
+    .join("")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 40);
+
+  return slug.length >= 2 ? slug : "role";
 }

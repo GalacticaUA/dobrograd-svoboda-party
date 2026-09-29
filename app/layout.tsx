@@ -6,6 +6,7 @@ import { AuthNotice } from "@/components/auth/auth-notice";
 import { SiteFooter } from "@/components/layout/site-footer";
 import { SiteHeader } from "@/components/layout/site-header";
 import { Toaster } from "@/components/ui/sonner";
+import { RolesProvider } from "@/components/roles/roles-store";
 import { missingAuthEnv } from "@/lib/env";
 import { SITE_NAME } from "@/data/content";
 import "./globals.css";
@@ -47,26 +48,31 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${fontSans.variable} ${fontDisplay.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col bg-background font-sans text-foreground">
-        {/* AuthButton is a server component that reads the session cookie; it is
-            passed in as a slot so the client-side header can render it. This
-            makes the root layout dynamic, which is the cost of server-read auth
-            state in the navigation. */}
-        <SiteHeader authSlot={<AuthButton />} />
-        <main className="flex-1 pt-18">{children}</main>
-        <SiteFooter />
+        {/* The one place a person's roles live in the browser, wrapping the header
+            as well as the page. It has to: the two surfaces that show roles are in
+            different subtrees — the admin panel's people table is `children`, and
+            the portal dialog hangs off the header button — so sharing state between
+            them needs a shared parent, and this is the only one. A change made in
+            the role editor has to be visible in the people table and in the portal
+            registry without a reload. */}
+        <RolesProvider>
+          <SiteHeader authSlot={<AuthButton />} />
+          <main className="flex-1 pt-18">{children}</main>
+          <SiteFooter />
 
-        {/* Turns ?auth=failed&reason=... into a readable toast, naming the exact
-            variables to fill in when the deployment is unconfigured. Rendered
-            inside Suspense because it reads searchParams. */}
-        <Suspense fallback={null}>
-          <AuthNotice missing={missingAuthEnv()} />
-        </Suspense>
+          {/* Turns ?auth=failed&reason=... into a readable toast, naming the exact
+              variables to fill in when the deployment is unconfigured. Rendered
+              inside Suspense because it reads searchParams. */}
+          <Suspense fallback={null}>
+            <AuthNotice missing={missingAuthEnv()} />
+          </Suspense>
 
-        {/* Single Toaster for the whole app, so every notification - auth
-            results, admin actions, CSV export - appears in the same
-            bottom-right corner. Individual toast() calls must not pass a
-            `position`, or they would escape this. */}
-        <Toaster position="bottom-right" richColors closeButton />
+          {/* Single Toaster for the whole app, so every notification - auth
+              results, admin actions, CSV export - appears in the same
+              bottom-right corner. Individual toast() calls must not pass a
+              `position`, or they would escape this. */}
+          <Toaster position="bottom-right" richColors closeButton />
+        </RolesProvider>
       </body>
     </html>
   );

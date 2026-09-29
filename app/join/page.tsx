@@ -1,11 +1,9 @@
 import type { Metadata } from "next";
-import { Clock, MapPin, Phone } from "lucide-react";
+import { Clock, MapPin, Phone, GlobeCode, UsersRound } from "lucide-react";
 import { Reveal } from "@/components/ui/reveal";
 import { SectionHeading } from "@/components/ui/section-heading";
 import { SpotlightCard } from "@/components/ui/spotlight-card";
 import { ShinyLink } from "@/components/ui/shiny-button";
-import { ApplicationForm } from "@/components/auth/application-form";
-import { getSessionProfile } from "@/lib/auth/dal";
 
 export const metadata: Metadata = {
   title: "Гражданская приёмная",
@@ -15,17 +13,10 @@ export const metadata: Metadata = {
 const hours = [
   { day: "Пн - Пт", time: "10:00 – 19:00" },
   { day: "Суббота", time: "11:00 – 15:00" },
-  { day: "Юрпомощь", time: "Ср 17:00 – 20:00" },
+  // { day: "Юрпомощь", time: "Ср 17:00 – 20:00" },
 ];
 
-export default async function JoinPage() {
-  // Prefilled, not required. A person removed from the party keeps their Steam
-  // account and can still sign in, so the form has their ID to hand - and that
-  // ID is what a reviewer approves, which is how the old profile and its hours
-  // come back instead of a fresh empty one being created under a typo.
-  const session = await getSessionProfile();
-  const defaultSteamId = session.ok ? session.profile.steamId : "";
-
+export default function JoinPage() {
   return (
     <>
       <section className="mx-auto max-w-3xl px-5 py-24 sm:px-8">
@@ -55,8 +46,8 @@ export default async function JoinPage() {
         <Reveal immediate>
           <SectionHeading
             eyebrow="Анкета"
-            title="Подать заявку"
-            description="Заявка попадает в очередь координационного совета. Решение принимает человек, а не эта страница."
+            title="Подать заявку на аккаунт"
+            description="Заявка попадает в очередь совета. Решение принимает человек, а не эта страница."
           />
         </Reveal>
         <Reveal immediate delay={0.08} className="mt-10">
@@ -96,11 +87,13 @@ export default async function JoinPage() {
               <SpotlightCard className="h-full">
                 <Phone className="h-6 w-6 text-primary" />
                 <h3 className="mt-4 text-lg font-semibold text-cloud">Связь</h3>
-                <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                <p className="mt-2 mb-2 text-sm leading-relaxed text-muted-foreground">
                   +1 (231) 547-4000
                   <br />
                   svoboda@ldp-freedom.org
                 </p>
+                <li className="flex gap-2.5"><GlobeCode className="h-4 w-4 shrink-0  text-muted-foreground" /> <a href="https://forum.octothorp.team/topic/13599/%D0%BF%D0%B0%D1%80%D1%82%D0%B8%D1%8F-%D1%81%D0%B2%D0%BE%D0%B1%D0%BE%D0%B4%D0%B0" className="story-link hover:text-cloud  text-muted-foreground">Форум</a></li>
+                <li className="flex gap-2.5"><UsersRound className="h-4 w-4 shrink-0  text-muted-foreground" /> <a href="https://discord.gg/PZUnuNvjtt" className="story-link hover:text-cloud  text-muted-foreground">Discord</a></li>
               </SpotlightCard>
             </Reveal>
           </div>
@@ -111,14 +104,14 @@ export default async function JoinPage() {
         </div>
       </section>
 
-      {/* <section className="mx-auto max-w-4xl px-5 py-24 sm:px-8">
+      <section className="mx-auto max-w-4xl px-5 py-24 sm:px-8">
         <SectionHeading
           eyebrow="Ближайшие встречи"
           title="Приходите без записи"
           description="Открытые встречи во всех районах Доброграда."
         />
 
-        <ul className="mt-12 divide-y divide-border border-y border-border">
+        {/* <ul className="mt-12 divide-y divide-border border-y border-border">
           {events.map((e) => (
             <li
               key={`${e.date}-${e.title}`}
@@ -155,8 +148,8 @@ export default async function JoinPage() {
               ))}
             </div>
           </div>
-        </Reveal>
-      </section> */}
+        </Reveal> */}
+      </section>
     </>
   );
 }

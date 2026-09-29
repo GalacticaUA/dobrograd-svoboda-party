@@ -46,13 +46,14 @@ const PLAYER_SUMMARIES_ENDPOINT =
  * redirect at a host they control.
  */
 export function buildSteamLoginUrl(returnTo?: string): string {
+  const siteUrl = getSiteUrl();
   const params = new URLSearchParams({
     "openid.ns": "http://specs.openid.net/auth/2.0",
     "openid.mode": "checkid_setup",
     "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
     "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
-    "openid.return_to": returnTo ?? `${getSiteUrl()}/api/auth/steam/callback`,
-    "openid.response_type": "code",
+    "openid.realm": siteUrl,
+    "openid.return_to": returnTo ?? `${siteUrl}/api/auth/steam/callback`,
   });
 
   return `${OPENID_ENDPOINT}?${params.toString()}`;

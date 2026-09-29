@@ -1,10 +1,12 @@
 "use client";
 
-import { useCallback, useState, useTransition } from "react";
-import { AtSign, Clock, Loader2, Pencil, Plus, Save, Shield, Trash2, UserMinus, Users } from "lucide-react";
+import { useCallback, useEffect, useState, useTransition } from "react";
+import { AtSign, Check, Clock, Loader2, Pencil, Plus, Save, Shield, Trash2, UserMinus, Users } from "lucide-react";
 import { toast } from "sonner";
 
 import { EmptyState, LoadingBlock, PageTitle, Panel, fieldCls } from "@/components/portal/primitives";
+import { RoleBadges } from "@/components/roles/role-badges";
+import { useRolesStore, useRoleOptions } from "@/components/roles/roles-store";
 import {
   Dialog,
   DialogContent,
@@ -20,19 +22,16 @@ import {
   saveHoursAdjustment,
   saveMemberProfile,
   saveMemberRemoval,
-  saveMemberRole,
+  saveMemberRoles,
+  saveMemberStatus,
 } from "@/lib/portal/actions";
 import { useAsyncData } from "@/hooks/use-async-data";
-import { can } from "@/lib/permissions";
 import { displayNameOf, type HoursAdjustmentRecord, type RegistryEntry } from "@/lib/portal/types";
+import { ROLE_LABEL } from "@/lib/role-labels";
 import type { ApprovalStatus, ProfileDTO } from "@/types/auth";
 import type { Role } from "@/types/party";
-
-const ROLE_LABELS: Record<Role, string> = {
-  leader: "Лидер",
-  admin: "Админ",
-  member: "Работник",
-};
+import { useCan } from "@/components/portal/permissions";
+import { ASSIGNABLE_ROLES, applyChange } from "@/lib/permissions";
 
 const STATUS_LABELS: Record<ApprovalStatus, string> = {
   approved: "Одобрен",
@@ -52,6 +51,45 @@ const STATUS_LABELS: Record<ApprovalStatus, string> = {
 export function RegistryTab({ profile }: { profile: ProfileDTO }) {
   const { data, error, pending, refresh } = useAsyncData<RegistryEntry[]>(loadRegistry);
   const [query, setQuery] = useState("");
+  const { seed: seedRoles } = useRolesStore();
+  // Above the early returns: these are hooks, and the loading and error branches
+  // are still renders of this component.
+  const maySetRole = useCan("profile.setRole");
+  // Matches the DAL's own test for handing out contact detail, which is
+  // `profile.editAny` rather than `report.viewAll` — reading somebody's hours is
+  // not what entitles you to their phone number.
+  const mayEditOthers = useCan("profile.editAny");
+  const mayRemove = useCan("profile.remove");
+
+  /**
+   * Hand the registry to the shared store.
+   *
+   * The portal dialog and the admin panel are different subtrees, so this is the
+   * only way a role granted in the admin panel's role editor can appear here
+   * without closing the portal and reloading it. What is seeded is exactly what
+   * `loadRegistry` returned — names, status, roles, nothing else — so the store
+   * never knows more about the party than this tab already did.
+   *
+   * The dependency is `seed` and not the store object. The store's identity changes
+   * on every confirmed edit — that is what makes it re-render the people table —
+   * so depending on the whole object re-ran this effect after each change and
+   * re-seeded the roles from `data`, which had been loaded before the edit. The
+   * effect would undo the promotion it was supposed to be showing. `seed` itself is
+   * created once for the provider's lifetime, so this fires when the data really is
+   * new and not when the store is.
+   */
+  useEffect(() => {
+    if (!data) return;
+    seedRoles(
+      data.map((entry) => ({
+        steamId: entry.steamId,
+        displayName: entry.displayName || entry.persona,
+        persona: entry.persona,
+        status: entry.status,
+        roles: entry.roles,
+      })),
+    );
+  }, [data, seedRoles]);
 
   if (pending) return <LoadingBlock />;
   if (error) {
@@ -74,9 +112,6 @@ export function RegistryTab({ profile }: { profile: ProfileDTO }) {
           .some((field) => String(field).toLowerCase().includes(needle)),
       )
     : all;
-
-  const isLeader = can(profile.role, "profile.setRole");
-  const isStaff = can(profile.role, "report.viewAll");
 
   return (
     <div className="space-y-4">
@@ -103,10 +138,15 @@ export function RegistryTab({ profile }: { profile: ProfileDTO }) {
             <RegistryCard
               key={entry.steamId}
               entry={entry}
-              canSetRole={isLeader}
-              canEdit={isStaff}
-              canRemove={can(profile.role, "profile.remove")}
+              /* An admin's role is not changed through the interface, so the
+                 button is withheld rather than shown-and-refused. The DAL would
+                 reject the save anyway; hiding it keeps the page from offering a
+                 thing that cannot happen. */
+              canSetRole={maySetRole && !entry.roles.includes("admin")}
+              canEdit={mayEditOthers}
+              canRemove={mayRemove}
               viewerId={profile.steamId}
+              viewerRoles={profile.roles}
               onChanged={refresh}
             />
           ))}
@@ -122,6 +162,7 @@ function RegistryCard({
   canEdit,
   canRemove,
   viewerId,
+  viewerRoles,
   onChanged,
 }: {
   entry: RegistryEntry;
@@ -129,10 +170,18 @@ function RegistryCard({
   canEdit: boolean;
   canRemove: boolean;
   viewerId: string;
+  viewerRoles: readonly Role[];
   onChanged: () => void;
 }) {
+  const store = useRolesStore();
+  const { addable, removable } = useRoleOptions(viewerRoles);
   const [editing, setEditing] = useState(false);
-  const [role, setRole] = useState<Role>(entry.role);
+  // Read through the store, so a change made in the admin panel's role editor is
+  // on this card before anybody reopens the portal.
+  const roles = store.rolesOf(entry.steamId);
+  // Seeded once, when the card mounts. Re-derived from the store on every change
+  // instead, and the box the reviewer just ticked would spring back under them.
+  const [picked, setPicked] = useState<Role[]>(roles);
   const [status, setStatus] = useState<ApprovalStatus>(entry.status);
   const [saving, startTransition] = useTransition();
 
@@ -145,19 +194,34 @@ function RegistryCard({
   // The server refuses both of these regardless, but a button you can press and
   // then be told "нельзя" is a worse experience than not having the button, and
   // the guards in the DAL exist for callers who are not this component.
-  const removable = canRemove && entry.steamId !== viewerId;
+  /* Expelling an admin is the same act as demoting them — the removal clears the
+     roles — so the admin is not offered for removal either. The DAL checks this
+     again; this keeps the button from appearing at all. */
+  const removableMember = canRemove && entry.steamId !== viewerId && !roles.includes("admin");
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     startTransition(async () => {
-      const result = await saveMemberRole({ steamId: entry.steamId, role, status });
-      if (result.ok) {
-        toast.success("Роль обновлена");
-        setEditing(false);
-        onChanged();
-      } else {
+      const result = await saveMemberRoles({ steamId: entry.steamId, roles: picked });
+      if (!result.ok) {
         toast.error(result.error);
+        return;
       }
+
+      // The status is a separate column with a separate reason for existing, so it
+      // is a separate call. Both are reported as one edit because to the reviewer
+      // they are one edit.
+      if (status !== entry.status) {
+        const statusResult = await saveMemberStatus(entry.steamId, status);
+        if (!statusResult.ok) {
+          toast.error(statusResult.error);
+          return;
+        }
+      }
+
+      toast.success("Роли обновлены");
+      setEditing(false);
+      onChanged();
     });
   };
 
@@ -177,9 +241,7 @@ function RegistryCard({
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="rounded-full bg-primary/15 px-2.5 py-1 text-xs text-primary">
-            {ROLE_LABELS[entry.role]}
-          </span>
+          <RoleBadges roles={roles} />
           <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
             <Clock className="h-3 w-3" />
             {entry.totalHours} ч
@@ -224,7 +286,7 @@ function RegistryCard({
               Изменить роль
             </CardAction>
           )}
-          {removable && (
+          {removableMember && (
             <CardAction
               icon={<UserMinus className="h-3.5 w-3.5" />}
               onClick={() => setRemoveOpen(true)}
@@ -239,20 +301,64 @@ function RegistryCard({
       {canSetRole && editing && (
         <form onSubmit={submit} className="mt-3 space-y-3 border-t border-border pt-3">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <label className="text-sm text-clock">
-              Роль
-              <select
-                value={role}
-                onChange={(event) => setRole(event.target.value as Role)}
-                className={`${fieldCls} mt-1`}
-              >
-                {Object.entries(ROLE_LABELS).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {/*
+              A list of ticks rather than a select, because a person can hold more
+              than one role and a select can only ever hold one. This is the same
+              question the people table asks with a `+` menu, and the same set of
+              boxes: `ASSIGNABLE_ROLES`, which excludes `admin` — the party grants
+              that by hand in the database, and the label map has to name it so it
+              can be *displayed* on a card, which is a different thing from offering
+              it as a choice. The rest of the rules — one leader at a time, not the
+              last appointer out — need party-wide counts this card does not have,
+              so they are left to the DAL, which re-checks and reports back.
+            */}
+            <fieldset className="text-sm text-clock">
+              <legend className="mb-1">Роли</legend>
+              <div className="space-y-1">
+                {ASSIGNABLE_ROLES.map((value) => {
+                  // A role this viewer may neither give nor take — the last
+                  // appointer's own `leader`, say — is drawn as a static fact
+                  // rather than a box that would be refused on submit.
+                  const editable =
+                    addable(entry.steamId).includes(value) || removable(entry.steamId).includes(value);
+
+                  if (!editable) {
+                    return (
+                      <p key={value} className="flex items-center gap-2 text-muted-foreground">
+                        {roles.includes(value) ? (
+                          <>
+                            <Check className="h-3.5 w-3.5" aria-hidden />
+                            {ROLE_LABEL[value]}
+                          </>
+                        ) : (
+                          <span className="pl-5.5 opacity-40">{ROLE_LABEL[value]}</span>
+                        )}
+                      </p>
+                    );
+                  }
+
+                  const checked = picked.includes(value);
+
+                  return (
+                    <label key={value} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() =>
+                          setPicked((previous) =>
+                            applyChange(previous, checked
+                              ? { kind: "remove", role: value }
+                              : { kind: "add", role: value }),
+                          )
+                        }
+                      />
+                      <span>{ROLE_LABEL[value]}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </fieldset>
+
             <label className="text-sm text-clock">
               Статус
               <select

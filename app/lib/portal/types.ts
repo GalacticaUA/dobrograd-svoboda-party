@@ -1,3 +1,4 @@
+import type { Action } from "@/lib/permissions";
 import type { ApprovalStatus, ProfileDTO } from "@/types/auth";
 import type { Role } from "@/types/party";
 
@@ -50,7 +51,15 @@ export function displayNameOf(p: {
 export interface AccountUpdateInput {
   displayName: string;
   about: string;
-  telegram: string;
+  /**
+   * Discord handle, stored in `profiles.discord`.
+   *
+   * This field used to be `telegram` while the form was already labelled
+   * "Дискорд", so a Discord username was being written into the Telegram column
+   * while the registry read `discord` and showed nothing. `profiles` has had both
+   * columns since the original schema, so the fix is to write the right one.
+   */
+  discord: string;
   contactsPublic: boolean;
 }
 
@@ -116,6 +125,9 @@ export function clockToMinutes(clock: string): number | null {
 export interface AvailabilityMatrixRow {
   steamId: string;
   name: string;
+  /** Every built-in role held, highest standing first. */
+  roles: Role[];
+  /** Highest-standing role. */
   role: Role;
   status: ApprovalStatus;
   slots: AvailabilitySlot[];
@@ -159,6 +171,16 @@ export interface EventRecord {
   state: EventState;
   /** Set when a staff member hid the event. It is filtered out of every list. */
   deletedAt: string | null;
+  /**
+   * Who scheduled it, or null on a database that predates the column.
+   *
+   * Carried to the browser on purpose: with database roles in play, "may I edit
+   * this event" is no longer a property of the viewer's role alone, it is that
+   * role plus whether they wrote the row. The client needs the author to decide
+   * which buttons to draw, and the server re-reads it and re-decides anyway —
+   * this is what the buttons show, not what they are allowed to do.
+   */
+  createdBy: string | null;
 }
 
 /**
@@ -405,6 +427,9 @@ export interface RegistryEntry {
   steamId: string;
   displayName: string;
   persona: string;
+  /** Every built-in role held, highest standing first. The badges render this. */
+  roles: Role[];
+  /** Highest-standing role. See `ProfileDTO.role`. */
   role: Role;
   status: ApprovalStatus;
   about: string;
@@ -436,4 +461,52 @@ export interface AuditEntry {
   entityId: string | null;
   meta: Record<string, unknown>;
   createdAt: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom roles                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A named bundle of permissions, granted on top of the built-in role.
+ *
+ * The action list here is already filtered by the server: it never contains
+ * `profile.setRole`, and it never contains anything the viewer does not hold.
+ * The UI renders exactly this list, so there is no second, wider source for the
+ * checkboxes to drift from.
+ */
+export interface CustomRoleRecord {
+  id: number;
+  /** Stable slug. Never displayed, never reused after a delete. */
+  key: string;
+  name: string;
+  description: string;
+  actions: Action[];
+  /** How many members currently hold it. Drives the "N people" warning. */
+  holderCount: number;
+  createdAt: string;
+}
+
+/** One member's holding of one custom role. */
+export interface RoleGrantRecord {
+  steamId: string;
+  displayName: string;
+  roleId: number;
+  roleKey: string;
+  roleName: string;
+  grantedBy: string | null;
+  grantedByName: string | null;
+  grantedAt: string;
+}
+
+/**
+ * The result of a batch grant or revoke.
+ *
+ * `skipped` is not a failure: it is the rows the database had already in the
+ * requested state. Reporting them separately stops the UI from telling somebody
+ * twenty permissions changed when it changed nine.
+ */
+export interface RoleGrantResult {
+  applied: string[];
+  skipped: string[];
 }

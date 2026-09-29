@@ -20,7 +20,8 @@ import { PortalDialog } from "@/components/portal/portal-dialog";
 import { signOut } from "@/lib/auth/actions";
 import { steamProfileUrl } from "@/lib/auth/profile";
 import { cn } from "@/lib/utils";
-import { isStaffRole, type ProfileDTO } from "@/types/auth";
+import type { Action } from "@/lib/permissions";
+import type { ProfileDTO } from "@/types/auth";
 import steamLogo from "@/assets/steam.png";
 
 
@@ -60,9 +61,20 @@ const STATUS_COPY: Record<ProfileDTO["status"], { label: string; variant: "defau
   rejected: { label: "Отклонён", variant: "destructive" },
 };
 
+/**
+ * The dialog says "Председатель" and "Администратор" where every other surface
+ * says "Лидер" and "Админ". Kept, deliberately and only here: this is the one
+ * place a member is talking to the site rather than administering it, and the
+ * formal word is the one that reads as an answer to "what am I".
+ *
+ * A set, because a person can hold several. This used to be a single badge off
+ * `profile.role`, which is the highest-standing role only — somebody who is an
+ * admin *and* a moderator was told they were an administrator and nothing else.
+ */
 const ROLE_COPY: Record<ProfileDTO["role"], string> = {
   leader: "Председатель",
   admin: "Администратор",
+  moderator: "Модератор",
   member: "Участник",
 };
 
@@ -73,14 +85,24 @@ const DOT_COLOR: Record<ProfileDTO["status"], string> = {
   rejected: "bg-destructive",
 };
 
-export function AuthDialog({ profile }: { profile: ProfileDTO | null }) {
+export function AuthDialog({
+  profile,
+  permissions,
+}: {
+  profile: ProfileDTO | null;
+  permissions: readonly Action[];
+}) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [open, setOpen] = useState(false);
   const [portalOpen, setPortalOpen] = useState(false);
 
   const isApproved = profile !== null && profile.status === "approved";
-  const canUseAdmin = isApproved && isStaffRole(profile.role);
+  // The admin panel is reached by `application.review`, not by holding a staff
+  // role. That is the difference the whole role system exists for: somebody who
+  // triages sign-in requests has no business expelling members or correcting
+  // hours, and `isStaffRole` gave them all of it.
+  const canUseAdmin = isApproved && permissions.includes("application.review");
 
   function handleSignOut() {
     startTransition(async () => {
@@ -159,6 +181,7 @@ export function AuthDialog({ profile }: { profile: ProfileDTO | null }) {
           open={portalOpen}
           onOpenChange={setPortalOpen}
           profile={profile}
+          permissions={permissions}
         />
       ) : null}
     </>
@@ -239,9 +262,13 @@ function SignedIn({
           </a>
           <div className="flex flex-wrap items-center gap-2 pt-0.5">
             <Badge variant={status.variant}>Статус: {status.label}</Badge>
-            {profile.status === "approved" ? (
-              <Badge variant="outline">{ROLE_COPY[profile.role]}</Badge>
-            ) : null}
+            {profile.status === "approved"
+              ? profile.roles.map((role) => (
+                  <Badge key={role} variant="outline">
+                    {ROLE_COPY[role]}
+                  </Badge>
+                ))
+              : null}
           </div>
         </div>
       </div>

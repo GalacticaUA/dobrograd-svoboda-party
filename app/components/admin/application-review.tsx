@@ -129,8 +129,8 @@ export function ApplicationReview({ initialApplications }: { initialApplications
           <TableHeader>
             <TableRow>
               <TableHead>ФИО</TableHead>
-              <TableHead>Район</TableHead>
-              <TableHead>Контакты</TableHead>
+              {/* <TableHead>Район</TableHead> */}
+              {/* <TableHead>Контакты</TableHead> */}
               <TableHead>Steam</TableHead>
               <TableHead>Мотивация</TableHead>
               <TableHead>Статус</TableHead>
@@ -148,13 +148,16 @@ export function ApplicationReview({ initialApplications }: { initialApplications
                   <TableCell className="font-medium text-cloud">
                     {application.name}
                     <span className="block text-xs font-normal text-muted-foreground">
-                      {SOURCE_LABEL[application.source]} · {application.submittedAt}
+                      {application.fromSignIn ? "Вход через Steam" : SOURCE_LABEL[application.source]} ·{" "}
+                      {application.submittedAt}
                     </span>
                   </TableCell>
 
-                  <TableCell className="whitespace-nowrap">{application.district}</TableCell>
+                  {/* <TableCell className="whitespace-nowrap">
+                    {application.fromSignIn ? "—" : application.district}
+                  </TableCell> */}
 
-                  <TableCell>
+                  {/* <TableCell>
                     <div className="space-y-0.5 text-sm">
                       {application.phone ? (
                         <a
@@ -173,7 +176,7 @@ export function ApplicationReview({ initialApplications }: { initialApplications
                         <span className="text-muted-foreground">Discord: {application.discord}</span>
                       ) : null}
                     </div>
-                  </TableCell>
+                  </TableCell> */}
 
                   <TableCell>
                     {application.steam ? (
